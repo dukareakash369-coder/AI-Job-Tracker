@@ -36,7 +36,8 @@ if not GOOGLE_JSON:
 
 # Google Sheets authorization
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
 ]
 
 try:
