@@ -1,4 +1,4 @@
-import os
+mport os
 import json
 import re
 from datetime import date
@@ -36,8 +36,7 @@ if not GOOGLE_JSON:
 
 # Google Sheets authorization
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/spreadsheets"
 ]
 
 try:
@@ -49,6 +48,7 @@ try:
     )
 
     gc = gspread.authorize(credentials)
+    print("Google service account:", service_account_info.get("client_email"))
 
 except Exception as error:
     print("Google authentication error:", error)
