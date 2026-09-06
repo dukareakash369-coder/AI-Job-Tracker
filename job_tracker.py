@@ -129,7 +129,7 @@ for role in roles:
 
     print(f"\nSuitable jobs found for {role}: {found}")
 
-print("\nJob filtering completed!")import os
+print("\nJob filtering completed!")
 import requests
 
 print("AI Job Tracker Started!")
