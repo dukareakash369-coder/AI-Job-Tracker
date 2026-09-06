@@ -1,9 +1,20 @@
 import os
+import json
+import re
+from datetime import date
+
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
+
 
 print("AI Job Tracker Started!")
 
-# Get Adzuna API credentials from GitHub Secrets
+
+# =========================================================
+# 1. ADZUNA CREDENTIALS
+# =========================================================
+
 APP_ID = os.environ.get("ADZUNA_APP_ID")
 APP_KEY = os.environ.get("ADZUNA_APP_KEY")
 
@@ -12,7 +23,61 @@ if not APP_ID or not APP_KEY:
     exit(1)
 
 
-# Target job roles
+# =========================================================
+# 2. GOOGLE SHEETS CREDENTIALS
+# =========================================================
+
+GOOGLE_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+if not GOOGLE_JSON:
+    print("ERROR: Google Service Account credentials not found.")
+    exit(1)
+
+
+# Google Sheets authorization
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+try:
+    service_account_info = json.loads(GOOGLE_JSON)
+
+    credentials = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=SCOPES
+    )
+
+    gc = gspread.authorize(credentials)
+
+except Exception as error:
+    print("Google authentication error:", error)
+    exit(1)
+
+
+# =========================================================
+# 3. GOOGLE SHEET
+# =========================================================
+
+SPREADSHEET_ID = "1A8XAEfCB6kEUqJBa9GLPPSyeSf6XMT0iAglsAa_xNVM"
+
+WORKSHEET_NAME = "Sheet1"
+
+try:
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+
+except Exception as error:
+    print("Google Sheet connection error:", error)
+    exit(1)
+
+
+print("Google Sheet connected successfully!")
+
+
+# =========================================================
+# 4. TARGET JOB ROLES
+# =========================================================
+
 roles = [
     "Embedded Engineer",
     "Embedded AI Engineer",
@@ -20,27 +85,28 @@ roles = [
     "Robotics Engineer"
 ]
 
-print("\nSearching for suitable jobs...\n")
 
+# =========================================================
+# 5. FILTER WORDS
+# =========================================================
 
-# Words that indicate experienced/senior jobs
 reject_words = [
     "senior",
+    "sr.",
+    "sr ",
     "lead",
     "manager",
     "principal",
     "architect",
+    "director",
     "5+ years",
     "6+ years",
     "7+ years",
     "8+ years",
-    "3-5 years",
-    "5-8 years",
     "10+ years"
 ]
 
 
-# Words that indicate fresher/entry-level jobs
 fresher_words = [
     "fresher",
     "entry level",
@@ -57,11 +123,52 @@ fresher_words = [
 ]
 
 
+# =========================================================
+# 6. GET EXISTING APPLY LINKS
+# =========================================================
+
+try:
+
+    existing_rows = worksheet.get_all_values()
+
+    existing_links = set()
+
+    # Apply Link is column I = index 8
+    for row in existing_rows[1:]:
+
+        if len(row) > 8:
+
+            link = row[8].strip()
+
+            if link:
+                existing_links.add(link)
+
+    print(
+        f"Existing jobs in Sheet: {len(existing_links)}"
+    )
+
+except Exception as error:
+
+    print(
+        "Could not read existing Sheet data:",
+        error
+    )
+
+    existing_links = set()
+
+
+# =========================================================
+# 7. SEARCH JOBS
+# =========================================================
+
+total_added = 0
+
+
 for role in roles:
 
-    print("=" * 50)
+    print("\n" + "=" * 60)
     print(f"Searching: {role}")
-    print("=" * 50)
+    print("=" * 60)
 
     url = "https://api.adzuna.com/v1/api/jobs/in/search/1"
 
@@ -74,7 +181,9 @@ for role in roles:
         "content-type": "application/json"
     }
 
+
     try:
+
         response = requests.get(
             url,
             params=params,
@@ -82,11 +191,13 @@ for role in roles:
         )
 
     except requests.RequestException as error:
+
         print("Request Error:", error)
         continue
 
 
     if response.status_code != 200:
+
         print("API Error:", response.status_code)
         print(response.text[:500])
         continue
@@ -97,49 +208,88 @@ for role in roles:
     found = 0
 
 
+    # =====================================================
+    # 8. PROCESS EACH JOB
+    # =====================================================
+
     for job in data.get("results", []):
 
-        title = job.get("title", "").strip()
+        title = job.get(
+            "title",
+            ""
+        ).strip()
+
 
         company = job.get(
-            "company", {}
+            "company",
+            {}
         ).get(
             "display_name",
             "Not specified"
         )
 
+
         location = job.get(
-            "location", {}
+            "location",
+            {}
         ).get(
             "display_name",
-            "Not specified"
+            "Pune"
         )
+
 
         description = job.get(
             "description",
             ""
+        )
+
+
+        text = (
+            title + " " + description
         ).lower()
 
 
-        # Combine title + description
-        text = (title + " " + description).lower()
+        # =================================================
+        # REJECT SENIOR JOBS
+        # =================================================
 
-
-        # Reject senior/experienced jobs
-        if any(word in text for word in reject_words):
+        if any(
+            word in text
+            for word in reject_words
+        ):
             continue
 
 
-        # Check fresher/entry-level indicators
+        # =================================================
+        # EXPERIENCE FILTER
+        # =================================================
+
+        # Detect explicit 3+ years requirement
+        high_experience = re.search(
+            r"\b([3-9]|1[0-9])\+?\s*(?:years?|yrs?)\b",
+            text
+        )
+
+
+        if high_experience:
+
+            required_years = int(
+                high_experience.group(1)
+            )
+
+            if required_years >= 3:
+                continue
+
+
         is_fresher = any(
             word in text
             for word in fresher_words
         )
 
 
-        # -------------------------
+        # =================================================
         # MATCH SCORE
-        # -------------------------
+        # =================================================
 
         score = 40
 
@@ -148,18 +298,18 @@ for role in roles:
             score += 25
 
 
-        # C / C++ skills
+        # C / C++
         if (
-            "c programming" in description
-            or "c language" in description
-            or "c/c++" in description
-            or "c++" in description
+            "c programming" in text
+            or "c language" in text
+            or "c/c++" in text
+            or "c++" in text
         ):
             score += 10
 
 
         # Python
-        if "python" in description:
+        if "python" in text:
             score += 5
 
 
@@ -170,8 +320,8 @@ for role in roles:
 
         # ESP32 / STM32
         if (
-            "esp32" in description
-            or "stm32" in description
+            "esp32" in text
+            or "stm32" in text
         ):
             score += 5
 
@@ -186,14 +336,21 @@ for role in roles:
             score += 5
 
 
-        # Maximum score = 100
         if score > 100:
             score = 100
 
 
-        # -------------------------
+        # =================================================
+        # ONLY GOOD MATCHES
+        # =================================================
+
+        if score < 60:
+            continue
+
+
+        # =================================================
         # SALARY
-        # -------------------------
+        # =================================================
 
         salary_min = job.get("salary_min")
         salary_max = job.get("salary_max")
@@ -209,50 +366,185 @@ for role in roles:
             )
 
 
-        # -------------------------
+        # =================================================
+        # EXPERIENCE TEXT
+        # =================================================
+
+        experience = "Not specified"
+
+
+        if is_fresher:
+
+            experience = "Fresher / 0-2 years"
+
+        elif high_experience:
+
+            experience = (
+                f"{high_experience.group(1)}+ years"
+            )
+
+
+        # =================================================
+        # SKILLS
+        # =================================================
+
+        skills = []
+
+
+        skill_keywords = {
+            "C": [
+                "c programming",
+                "c language",
+                "c/c++"
+            ],
+
+            "C++": [
+                "c++"
+            ],
+
+            "Python": [
+                "python"
+            ],
+
+            "Embedded": [
+                "embedded"
+            ],
+
+            "ESP32": [
+                "esp32"
+            ],
+
+            "STM32": [
+                "stm32"
+            ],
+
+            "IoT": [
+                "iot"
+            ],
+
+            "Robotics": [
+                "robotics"
+            ],
+
+            "Linux": [
+                "linux"
+            ],
+
+            "RTOS": [
+                "rtos"
+            ]
+        }
+
+
+        for skill, keywords in skill_keywords.items():
+
+            if any(
+                keyword in text
+                for keyword in keywords
+            ):
+
+                skills.append(skill)
+
+
+        skills_text = ", ".join(skills)
+
+        if not skills_text:
+            skills_text = "Not specified"
+
+
+        # =================================================
         # APPLY LINK
-        # -------------------------
+        # =================================================
 
         apply_link = job.get(
             "redirect_url",
-            "Not available"
+            ""
         )
 
 
-        # -------------------------
-        # PRINT JOB
-        # -------------------------
+        if not apply_link:
+            continue
 
-        print("\n" + "-" * 50)
 
-        print("Job:", title)
+        # =================================================
+        # DUPLICATE CHECK
+        # =================================================
 
-        print("Company:", company)
+        if apply_link in existing_links:
 
-        print("Location:", location)
+            print(
+                "Skipping duplicate:",
+                title
+            )
 
-        print("Salary:", salary)
+            continue
 
-        print(
-            "Fresher/Entry Level:",
-            "Yes" if is_fresher else "Not specified"
-        )
 
-        print(
-            "Match Score:",
+        # =================================================
+        # ADD TO GOOGLE SHEET
+        # =================================================
+
+        row = [
+            str(date.today()),
+            company,
+            title,
+            location,
+            salary,
+            experience,
+            skills_text,
             score,
-            "/100"
-        )
-
-        print("Apply:", apply_link)
-
-        found += 1
+            apply_link,
+            "Not Applied"
+        ]
 
 
-    print("\nSuitable jobs found for "
-          f"{role}: {found}")
+        try:
+
+            worksheet.append_row(
+                row,
+                value_input_option="USER_ENTERED"
+            )
+
+            existing_links.add(apply_link)
+
+            total_added += 1
+            found += 1
 
 
-print("\n" + "=" * 50)
-print("Job filtering completed!")
-print("=" * 50)
+            print("\n" + "-" * 60)
+            print("ADDED TO GOOGLE SHEET")
+            print("Job:", title)
+            print("Company:", company)
+            print("Location:", location)
+            print("Salary:", salary)
+            print("Experience:", experience)
+            print("Skills:", skills_text)
+            print("Match Score:", score, "/100")
+            print("Apply:", apply_link)
+
+
+        except Exception as error:
+
+            print(
+                "Could not add job to Sheet:",
+                error
+            )
+
+
+    print(
+        f"\nSuitable new jobs for {role}: {found}"
+    )
+
+
+# =========================================================
+# 9. COMPLETION
+# =========================================================
+
+print("\n" + "=" * 60)
+
+print(
+    f"Job filtering completed! "
+    f"New jobs added: {total_added}"
+)
+
+print("=" * 60)
