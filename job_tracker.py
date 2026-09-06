@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 
 print("AI Job Tracker Started!")
@@ -18,40 +17,13 @@ roles = [
     "Robotics Engineer"
 ]
 
-# Jobs we do NOT want
-senior_keywords = [
-    "senior",
-    "lead",
-    "principal",
-    "manager",
-    "architect",
-    "head",
-    "director"
-]
-
-# Skills important for our target
-target_skills = [
-    "c",
-    "c++",
-    "python",
-    "embedded",
-    "microcontroller",
-    "esp32",
-    "stm32",
-    "rtos",
-    "uart",
-    "spi",
-    "i2c",
-    "can",
-    "linux",
-    "iot",
-    "robotics",
-    "edge ai"
-]
-
-print("\nSearching Pune jobs...")
+print("\nSearching for suitable jobs...\n")
 
 for role in roles:
+
+    print("=" * 40)
+    print(role)
+    print("=" * 40)
 
     url = "https://api.adzuna.com/v1/api/jobs/in/search/1"
 
@@ -72,117 +44,89 @@ for role in roles:
 
     data = response.json()
 
-    print(f"\n===== {role} =====")
-
     found = 0
 
     for job in data.get("results", []):
 
-        title = job.get("title", "N/A")
-        description = job.get("description", "")
-        company = job.get("company", {}).get(
-            "display_name", "N/A"
-        )
-        location = job.get("location", {}).get(
-            "display_name", "N/A"
-        )
+        title = job.get("title", "")
+        company = job.get("company", {}).get("display_name", "Not specified")
+        location = job.get("location", {}).get("display_name", "Not specified")
+        description = job.get("description", "").lower()
 
-        salary_min = job.get("salary_min")
-        salary_max = job.get("salary_max")
-
-        apply_link = job.get("redirect_url", "N/A")
+        # Reject senior / experienced jobs
+        reject_words = [
+            "senior",
+            "lead",
+            "manager",
+            "5+ years",
+            "6+ years",
+            "7+ years",
+            "8+ years",
+            "3-5 years",
+            "5-8 years"
+        ]
 
         text = (title + " " + description).lower()
 
-        # --------------------------------
-        # FILTER 1: Remove senior positions
-        # --------------------------------
-
-        if any(word in title.lower() for word in senior_keywords):
+        if any(word in text for word in reject_words):
             continue
 
-        # --------------------------------
-        # FILTER 2: Remove jobs requiring 3+ years
-        # --------------------------------
-
-        experience_patterns = [
-            r"minimum of (\d+)\s*-\s*(\d+)\s*years",
-            r"minimum (\d+)\s*years",
-            r"(\d+)\s*-\s*(\d+)\s*years of experience",
-            r"(\d+)\+\s*years"
-        ]
-
-        too_experienced = False
-
-        for pattern in experience_patterns:
-
-            matches = re.findall(pattern, text)
-
-            for match in matches:
-
-                if isinstance(match, tuple):
-                    first_number = int(match[0])
-                else:
-                    first_number = int(match)
-
-                if first_number >= 3:
-                    too_experienced = True
-
-        if too_experienced:
-            continue
-
-        # --------------------------------
-        # FILTER 3: Calculate Match Score
-        # --------------------------------
-
-        score = 0
-
-        # Role match
-        if any(word in text for word in [
-            "embedded",
-            "iot",
-            "robotics",
-            "edge ai"
-        ]):
-            score += 30
-
-        # Location
-        if "pune" in location.lower():
-            score += 20
-
-        # Skills
-        skill_matches = 0
-
-        for skill in target_skills:
-            if skill in text:
-                skill_matches += 1
-
-        score += min(skill_matches * 5, 30)
-
-        # Fresher / junior keywords
-        if any(word in text for word in [
+        # Look for fresher / entry-level indicators
+        fresher_words = [
             "fresher",
             "entry level",
+            "entry-level",
             "junior",
             "trainee",
             "graduate",
             "0-2 years",
-            "0 to 2 years"
-        ]):
+            "0 to 2 years",
+            "1-2 years",
+            "1 to 2 years"
+        ]
+
+        is_fresher = any(word in text for word in fresher_words)
+
+        # Calculate match score
+        score = 50
+
+        if is_fresher:
             score += 20
+
+        if "c" in description or "c++" in description:
+            score += 10
+
+        if "python" in description:
+            score += 5
+
+        if "esp32" in description or "stm32" in description:
+            score += 5
+
+        if "embedded" in text:
+            score += 10
+
+        if score > 100:
+            score = 100
+
+        salary_min = job.get("salary_min")
+        salary_max = job.get("salary_max")
+
+        salary = "Not specified"
+
+        if salary_min or salary_max:
+            salary = f"{salary_min or 'N/A'} - {salary_max or 'N/A'} per year"
+
+        apply_link = job.get("redirect_url", "Not available")
+
+        print("\nJob:", title)
+        print("Company:", company)
+        print("Location:", location)
+        print("Salary:", salary)
+        print("Match Score:", score, "/100")
+        print("Apply:", apply_link)
 
         found += 1
 
-        print("\n----------------------------")
-        print("Job:", title)
-        print("Company:", company)
-        print("Location:", location)
-        print("Salary:", salary_min, "-", salary_max)
-        print("Match Score:", score, "/ 100")
-        print("Apply:", apply_link)
-
-    print(
-        f"\nSuitable jobs found for {role}: {found}"
-    )
+    print(f"\nSuitable jobs found for {role}: {found}")
 
 print("\nJob filtering completed!")
