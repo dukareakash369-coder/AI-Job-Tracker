@@ -1,4 +1,4 @@
-import os
+mport os
 import json
 import re
 from datetime import date
@@ -36,8 +36,7 @@ if not GOOGLE_JSON:
 
 # Google Sheets authorization
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/spreadsheets"
 ]
 
 try:
@@ -49,6 +48,27 @@ try:
     )
 
     gc = gspread.authorize(credentials)
+    print("Google service account:", service_account_info.get("client_email"))
+
+# Diagnostic: ask Google Drive directly whether this exact spreadsheet ID is visible.
+# This avoids gspread hiding the actual Google API response behind "<Response [404]>".
+try:
+    from google.auth.transport.requests import AuthorizedSession
+
+    session = AuthorizedSession(credentials)
+    drive_url = f"https://www.googleapis.com/drive/v3/files/{SPREADSHEET_ID}"
+    drive_response = session.get(
+        drive_url,
+        params={"fields": "id,name,mimeType,trashed,owners(emailAddress)"},
+        timeout=30,
+    )
+
+    print("DIRECT DRIVE STATUS:", drive_response.status_code)
+    print("DIRECT DRIVE RESPONSE:", drive_response.text[:1000])
+
+except Exception as error:
+    print("Direct Drive diagnostic error:", error)
+
 
 except Exception as error:
     print("Google authentication error:", error)
@@ -63,12 +83,18 @@ SPREADSHEET_ID = "1A8XAEfCB6kEUqJBa9GLPPSyeSf6XMT0iAglsAa_xNVM"
 
 WORKSHEET_NAME = "Sheet1"
 
+# Stop after the direct API diagnostic for this test.
+exit(0)
+
 try:
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    # Open the spreadsheet by its exact name instead of spreadsheet ID.
+    # This uses the Google Drive scope and avoids the current 404 from open_by_key().
+    spreadsheet = gc.open("AI Job Tracker")
     worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 except Exception as error:
     print("Google Sheet connection error:", error)
+    print("Could not open spreadsheet by name: AI Job Tracker")
     exit(1)
 
 
