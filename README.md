@@ -96,12 +96,12 @@ Automated Scheduled Execution
 
 ### 1. GitHub Repository
 
-![GitHub Repository](1.png)
+![GitHub Repository](./1.png)
 
 ### 2. GitHub Actions – Successful Run
 
-![GitHub Actions](2.png)
+![GitHub Actions](./2.png)
 
 ### 3. Google Sheets – Job Data
 
-![Google Sheets](3.png)
+![Google Sheets](./3.png)
