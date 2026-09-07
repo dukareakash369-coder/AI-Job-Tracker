@@ -49,7 +49,6 @@ try:
     )
 
     gc = gspread.authorize(credentials)
-    print("Google service account:", service_account_info.get("client_email"))
 
 except Exception as error:
     print("Google authentication error:", error)
@@ -60,30 +59,17 @@ except Exception as error:
 # 3. GOOGLE SHEET
 # =========================================================
 
-SPREADSHEET_ID = "1A8XAEfCB6kEUqJBa9GLPPSyeSf6XMT0iAglsAa_xNVM"
+SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 
 WORKSHEET_NAME = "Sheet1"
 
-# Direct Google Drive diagnostic.
-# This test asks Google directly whether the service account can see the exact spreadsheet ID.
 try:
-    from google.auth.transport.requests import AuthorizedSession
-
-    session = AuthorizedSession(credentials)
-    drive_url = f"https://www.googleapis.com/drive/v3/files/{SPREADSHEET_ID}"
-    drive_response = session.get(
-        drive_url,
-        params={"fields": "id,name,mimeType,trashed"},
-        timeout=30,
-    )
-
-    print("DIRECT DRIVE STATUS:", drive_response.status_code)
-    print("DIRECT DRIVE RESPONSE:", drive_response.text[:1000])
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 except Exception as error:
-    print("Direct Drive diagnostic error:", error)
-
-exit(0)
+    print("Google Sheet connection error:", error)
+    exit(1)
 
 
 print("Google Sheet connected successfully!")
