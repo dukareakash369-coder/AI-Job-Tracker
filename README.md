@@ -260,6 +260,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON
 
 ![Google Sheets](./3.png)
 
+### 4. Google Sheets – Job Data
+
+![Google Sheets](./4.png)
+
 ---
 
 ## 📈 V1 Status
