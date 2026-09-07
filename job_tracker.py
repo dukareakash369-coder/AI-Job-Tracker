@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-print("AI Job Tracker Started!")
+print("AI Job Tracker V1.1 Started!")
 
 
 # =========================================================
@@ -34,7 +34,6 @@ if not GOOGLE_JSON:
     exit(1)
 
 
-# Google Sheets authorization
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -76,19 +75,36 @@ print("Google Sheet connected successfully!")
 
 
 # =========================================================
-# 4. TARGET JOB ROLES
+# 4. SEARCH QUERIES
 # =========================================================
 
-roles = [
+search_queries = [
     "Embedded Engineer",
+    "Embedded Software Engineer",
+    "Embedded Systems Engineer",
+    "Firmware Engineer",
+    "Junior Embedded Engineer",
     "Embedded AI Engineer",
+    "Edge AI Engineer",
     "IoT Engineer",
-    "Robotics Engineer"
+    "Junior IoT Engineer",
+    "Robotics Engineer",
+    "Junior Robotics Engineer"
 ]
 
 
 # =========================================================
-# 5. FILTER WORDS
+# 5. TARGET LOCATIONS
+# =========================================================
+
+locations = [
+    "Pune",
+    "Remote"
+]
+
+
+# =========================================================
+# 6. REJECT WORDS
 # =========================================================
 
 reject_words = [
@@ -100,13 +116,13 @@ reject_words = [
     "principal",
     "architect",
     "director",
-    "5+ years",
-    "6+ years",
-    "7+ years",
-    "8+ years",
-    "10+ years"
+    "head of"
 ]
 
+
+# =========================================================
+# 7. FRESHER / ENTRY LEVEL WORDS
+# =========================================================
 
 fresher_words = [
     "fresher",
@@ -115,6 +131,7 @@ fresher_words = [
     "junior",
     "trainee",
     "graduate",
+    "intern",
     "0-1 years",
     "0-2 years",
     "0 to 1 years",
@@ -125,7 +142,7 @@ fresher_words = [
 
 
 # =========================================================
-# 6. GET EXISTING APPLY LINKS
+# 8. GET EXISTING APPLY LINKS
 # =========================================================
 
 try:
@@ -134,7 +151,7 @@ try:
 
     existing_links = set()
 
-    # Apply Link is column I = index 8
+    # Apply Link = Column I = index 8
     for row in existing_rows[1:]:
 
         if len(row) > 8:
@@ -159,393 +176,550 @@ except Exception as error:
 
 
 # =========================================================
-# 7. SEARCH JOBS
+# 9. API SETTINGS
+# =========================================================
+
+API_URL = (
+    "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
+)
+
+RESULTS_PER_PAGE = 20
+
+TOTAL_PAGES = 3
+
+
+# =========================================================
+# 10. TOTAL COUNTERS
 # =========================================================
 
 total_added = 0
+total_seen = 0
+total_rejected = 0
 
 
-for role in roles:
+# =========================================================
+# 11. SEARCH JOBS
+# =========================================================
 
-    print("\n" + "=" * 60)
-    print(f"Searching: {role}")
-    print("=" * 60)
+for location in locations:
 
-    url = "https://api.adzuna.com/v1/api/jobs/in/search/1"
+    for query in search_queries:
 
-    params = {
-        "app_id": APP_ID,
-        "app_key": APP_KEY,
-        "what": role,
-        "where": "Pune",
-        "results_per_page": 20,
-        "content-type": "application/json"
-    }
+        print("\n" + "=" * 70)
+        print(f"Searching: {query}")
+        print(f"Location: {location}")
+        print("=" * 70)
 
+        for page in range(1, TOTAL_PAGES + 1):
 
-    try:
+            print(f"Fetching page {page}...")
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=30
-        )
+            url = API_URL.format(page=page)
 
-    except requests.RequestException as error:
+            params = {
+                "app_id": APP_ID,
+                "app_key": APP_KEY,
+                "what": query,
+                "where": location,
+                "results_per_page": RESULTS_PER_PAGE,
+                "content-type": "application/json"
+            }
 
-        print("Request Error:", error)
-        continue
+            try:
 
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=30
+                )
 
-    if response.status_code != 200:
+            except requests.RequestException as error:
 
-        print("API Error:", response.status_code)
-        print(response.text[:500])
-        continue
-
-
-    data = response.json()
-
-    found = 0
-
-
-    # =====================================================
-    # 8. PROCESS EACH JOB
-    # =====================================================
-
-    for job in data.get("results", []):
-
-        title = job.get(
-            "title",
-            ""
-        ).strip()
-
-
-        company = job.get(
-            "company",
-            {}
-        ).get(
-            "display_name",
-            "Not specified"
-        )
-
-
-        location = job.get(
-            "location",
-            {}
-        ).get(
-            "display_name",
-            "Pune"
-        )
-
-
-        description = job.get(
-            "description",
-            ""
-        )
-
-
-        text = (
-            title + " " + description
-        ).lower()
-
-
-        # =================================================
-        # REJECT SENIOR JOBS
-        # =================================================
-
-        if any(
-            word in text
-            for word in reject_words
-        ):
-            continue
-
-
-        # =================================================
-        # EXPERIENCE FILTER
-        # =================================================
-
-        # Detect explicit 3+ years requirement
-        high_experience = re.search(
-            r"\b([3-9]|1[0-9])\+?\s*(?:years?|yrs?)\b",
-            text
-        )
-
-
-        if high_experience:
-
-            required_years = int(
-                high_experience.group(1)
-            )
-
-            if required_years >= 3:
+                print("Request Error:", error)
                 continue
 
 
-        is_fresher = any(
-            word in text
-            for word in fresher_words
-        )
+            if response.status_code != 200:
 
+                print(
+                    "API Error:",
+                    response.status_code
+                )
 
-        # =================================================
-        # MATCH SCORE
-        # =================================================
+                print(response.text[:500])
 
-        score = 40
+                continue
 
 
-        if is_fresher:
-            score += 25
+            try:
 
+                data = response.json()
 
-        # C / C++
-        if (
-            "c programming" in text
-            or "c language" in text
-            or "c/c++" in text
-            or "c++" in text
-        ):
-            score += 10
+            except ValueError:
 
+                print("Invalid JSON response.")
 
-        # Python
-        if "python" in text:
-            score += 5
+                continue
 
 
-        # Embedded
-        if "embedded" in text:
-            score += 10
-
-
-        # ESP32 / STM32
-        if (
-            "esp32" in text
-            or "stm32" in text
-        ):
-            score += 5
-
-
-        # IoT
-        if "iot" in text:
-            score += 5
-
-
-        # Robotics
-        if "robotics" in text:
-            score += 5
-
-
-        if score > 100:
-            score = 100
-
-
-        # =================================================
-        # ONLY GOOD MATCHES
-        # =================================================
-
-        if score < 60:
-            continue
-
-
-        # =================================================
-        # SALARY
-        # =================================================
-
-        salary_min = job.get("salary_min")
-        salary_max = job.get("salary_max")
-
-        salary = "Not specified"
-
-
-        if salary_min or salary_max:
-
-            salary = (
-                f"{salary_min or 'N/A'} - "
-                f"{salary_max or 'N/A'} per year"
-            )
-
-
-        # =================================================
-        # EXPERIENCE TEXT
-        # =================================================
-
-        experience = "Not specified"
-
-
-        if is_fresher:
-
-            experience = "Fresher / 0-2 years"
-
-        elif high_experience:
-
-            experience = (
-                f"{high_experience.group(1)}+ years"
-            )
-
-
-        # =================================================
-        # SKILLS
-        # =================================================
-
-        skills = []
-
-
-        skill_keywords = {
-            "C": [
-                "c programming",
-                "c language",
-                "c/c++"
-            ],
-
-            "C++": [
-                "c++"
-            ],
-
-            "Python": [
-                "python"
-            ],
-
-            "Embedded": [
-                "embedded"
-            ],
-
-            "ESP32": [
-                "esp32"
-            ],
-
-            "STM32": [
-                "stm32"
-            ],
-
-            "IoT": [
-                "iot"
-            ],
-
-            "Robotics": [
-                "robotics"
-            ],
-
-            "Linux": [
-                "linux"
-            ],
-
-            "RTOS": [
-                "rtos"
-            ]
-        }
-
-
-        for skill, keywords in skill_keywords.items():
-
-            if any(
-                keyword in text
-                for keyword in keywords
-            ):
-
-                skills.append(skill)
-
-
-        skills_text = ", ".join(skills)
-
-        if not skills_text:
-            skills_text = "Not specified"
-
-
-        # =================================================
-        # APPLY LINK
-        # =================================================
-
-        apply_link = job.get(
-            "redirect_url",
-            ""
-        )
-
-
-        if not apply_link:
-            continue
-
-
-        # =================================================
-        # DUPLICATE CHECK
-        # =================================================
-
-        if apply_link in existing_links:
+            jobs = data.get("results", [])
 
             print(
-                "Skipping duplicate:",
-                title
-            )
-
-            continue
-
-
-        # =================================================
-        # ADD TO GOOGLE SHEET
-        # =================================================
-
-        row = [
-            str(date.today()),
-            company,
-            title,
-            location,
-            salary,
-            experience,
-            skills_text,
-            score,
-            apply_link,
-            "Not Applied"
-        ]
-
-
-        try:
-
-            worksheet.append_row(
-                row,
-                value_input_option="USER_ENTERED"
-            )
-
-            existing_links.add(apply_link)
-
-            total_added += 1
-            found += 1
-
-
-            print("\n" + "-" * 60)
-            print("ADDED TO GOOGLE SHEET")
-            print("Job:", title)
-            print("Company:", company)
-            print("Location:", location)
-            print("Salary:", salary)
-            print("Experience:", experience)
-            print("Skills:", skills_text)
-            print("Match Score:", score, "/100")
-            print("Apply:", apply_link)
-
-
-        except Exception as error:
-
-            print(
-                "Could not add job to Sheet:",
-                error
+                f"Jobs received: {len(jobs)}"
             )
 
 
-    print(
-        f"\nSuitable new jobs for {role}: {found}"
-    )
+            # =================================================
+            # 12. PROCESS EACH JOB
+            # =================================================
+
+            for job in jobs:
+
+                total_seen += 1
+
+                title = job.get(
+                    "title",
+                    ""
+                ).strip()
+
+
+                if not title:
+                    continue
+
+
+                # -------------------------------------------------
+                # COMPANY
+                # -------------------------------------------------
+
+                company_data = job.get(
+                    "company",
+                    {}
+                )
+
+                company = company_data.get(
+                    "display_name",
+                    "Not specified"
+                )
+
+                if not company:
+                    company = "Not specified"
+
+
+                # -------------------------------------------------
+                # LOCATION
+                # -------------------------------------------------
+
+                location_data = job.get(
+                    "location",
+                    {}
+                )
+
+                job_location = location_data.get(
+                    "display_name",
+                    location
+                )
+
+                if not job_location:
+                    job_location = location
+
+
+                # -------------------------------------------------
+                # DESCRIPTION
+                # -------------------------------------------------
+
+                description = job.get(
+                    "description",
+                    ""
+                )
+
+
+                text = (
+                    title
+                    + " "
+                    + description
+                ).lower()
+
+
+                # =================================================
+                # 13. REJECT SENIOR ROLES
+                # =================================================
+
+                if any(
+                    word in text
+                    for word in reject_words
+                ):
+
+                    total_rejected += 1
+
+                    print(
+                        "Rejected senior-level:",
+                        title
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 14. EXPERIENCE FILTER
+                # =================================================
+
+                high_experience = re.search(
+                    r"\b([3-9]|1[0-9])\+?\s*(?:years?|yrs?)\b",
+                    text
+                )
+
+
+                if high_experience:
+
+                    required_years = int(
+                        high_experience.group(1)
+                    )
+
+                    if required_years >= 3:
+
+                        total_rejected += 1
+
+                        print(
+                            "Rejected experience:",
+                            title
+                        )
+
+                        continue
+
+
+                is_fresher = any(
+                    word in text
+                    for word in fresher_words
+                )
+
+
+                # =================================================
+                # 15. MATCH SCORE
+                # =================================================
+
+                score = 35
+
+
+                # Fresher / entry-level
+                if is_fresher:
+                    score += 20
+
+
+                # C / C++
+                if (
+                    "c programming" in text
+                    or "c language" in text
+                    or "c/c++" in text
+                    or "c++" in text
+                ):
+                    score += 10
+
+
+                # Python
+                if "python" in text:
+                    score += 5
+
+
+                # Embedded
+                if "embedded" in text:
+                    score += 10
+
+
+                # ESP32 / STM32
+                if (
+                    "esp32" in text
+                    or "stm32" in text
+                ):
+                    score += 5
+
+
+                # IoT
+                if "iot" in text:
+                    score += 5
+
+
+                # Robotics
+                if (
+                    "robotics" in text
+                    or "ros" in text
+                ):
+                    score += 5
+
+
+                # Linux
+                if "linux" in text:
+                    score += 3
+
+
+                # RTOS
+                if "rtos" in text:
+                    score += 3
+
+
+                # Pune priority
+                if "pune" in job_location.lower():
+                    score += 5
+
+
+                # Remote priority
+                if "remote" in job_location.lower():
+                    score += 5
+
+
+                # Maximum 100
+                if score > 100:
+                    score = 100
+
+
+                # =================================================
+                # 16. MINIMUM SCORE
+                # =================================================
+
+                if score < 55:
+
+                    total_rejected += 1
+
+                    print(
+                        "Rejected low score:",
+                        title,
+                        score
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 17. SALARY
+                # =================================================
+
+                salary_min = job.get(
+                    "salary_min"
+                )
+
+                salary_max = job.get(
+                    "salary_max"
+                )
+
+                salary = "Not specified"
+
+
+                if salary_min or salary_max:
+
+                    salary = (
+                        f"{salary_min or 'N/A'} - "
+                        f"{salary_max or 'N/A'} per year"
+                    )
+
+
+                # =================================================
+                # 18. EXPERIENCE TEXT
+                # =================================================
+
+                experience = "Not specified"
+
+
+                if is_fresher:
+
+                    experience = (
+                        "Fresher / 0-2 years"
+                    )
+
+                elif high_experience:
+
+                    experience = (
+                        f"{high_experience.group(1)}+ years"
+                    )
+
+
+                # =================================================
+                # 19. SKILLS
+                # =================================================
+
+                skills = []
+
+
+                skill_keywords = {
+
+                    "C": [
+                        "c programming",
+                        "c language",
+                        "c/c++"
+                    ],
+
+                    "C++": [
+                        "c++"
+                    ],
+
+                    "Python": [
+                        "python"
+                    ],
+
+                    "Embedded": [
+                        "embedded"
+                    ],
+
+                    "ESP32": [
+                        "esp32"
+                    ],
+
+                    "STM32": [
+                        "stm32"
+                    ],
+
+                    "IoT": [
+                        "iot"
+                    ],
+
+                    "Robotics": [
+                        "robotics"
+                    ],
+
+                    "ROS": [
+                        "ros"
+                    ],
+
+                    "Linux": [
+                        "linux"
+                    ],
+
+                    "RTOS": [
+                        "rtos"
+                    ]
+                }
+
+
+                for skill, keywords in skill_keywords.items():
+
+                    if any(
+                        keyword in text
+                        for keyword in keywords
+                    ):
+
+                        skills.append(skill)
+
+
+                skills_text = ", ".join(skills)
+
+
+                if not skills_text:
+                    skills_text = "Not specified"
+
+
+                # =================================================
+                # 20. APPLY LINK
+                # =================================================
+
+                apply_link = job.get(
+                    "redirect_url",
+                    ""
+                )
+
+
+                if not apply_link:
+                    continue
+
+
+                # =================================================
+                # 21. DUPLICATE CHECK
+                # =================================================
+
+                if apply_link in existing_links:
+
+                    print(
+                        "Skipping duplicate:",
+                        title
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 22. ADD TO GOOGLE SHEET
+                # =================================================
+
+                row = [
+
+                    str(date.today()),
+
+                    company,
+
+                    title,
+
+                    job_location,
+
+                    salary,
+
+                    experience,
+
+                    skills_text,
+
+                    score,
+
+                    apply_link,
+
+                    "Not Applied"
+                ]
+
+
+                try:
+
+                    worksheet.append_row(
+                        row,
+                        value_input_option="USER_ENTERED"
+                    )
+
+                    existing_links.add(
+                        apply_link
+                    )
+
+                    total_added += 1
+
+
+                    print("\n" + "-" * 70)
+                    print("NEW JOB ADDED")
+                    print("Job:", title)
+                    print("Company:", company)
+                    print("Location:", job_location)
+                    print("Salary:", salary)
+                    print("Experience:", experience)
+                    print("Skills:", skills_text)
+                    print("Match Score:", score, "/100")
+                    print("Apply:", apply_link)
+                    print("-" * 70)
+
+
+                except Exception as error:
+
+                    print(
+                        "Could not add job to Sheet:",
+                        error
+                    )
 
 
 # =========================================================
-# 9. COMPLETION
+# 23. FINAL SUMMARY
 # =========================================================
 
-print("\n" + "=" * 60)
+print("\n" + "=" * 70)
 
 print(
-    f"Job filtering completed! "
+    "JOB SEARCH COMPLETED"
+)
+
+print(
+    f"Total jobs seen: {total_seen}"
+)
+
+print(
     f"New jobs added: {total_added}"
 )
 
-print("=" * 60)
+print(
+    f"Jobs rejected: {total_rejected}"
+)
+
+print("=" * 70)
+
+print(
+    "AI Job Tracker V1.1 Finished Successfully!"
+)
