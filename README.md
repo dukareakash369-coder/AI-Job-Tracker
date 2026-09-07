@@ -260,7 +260,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON
 
 ![Google Sheets](./3.png)
 
-### 4. Google Sheets – Job Data
+### 4. Project Architecture
 
 ![Google Sheets](./4.png)
 
