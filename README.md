@@ -89,3 +89,19 @@ Google Sheets
 GitHub Actions
        ↓
 Automated Scheduled Execution
+
+---
+
+## 📸 Project Screenshots
+
+### 1. GitHub Repository
+
+![GitHub Repository](1.png)
+
+### 2. GitHub Actions – Successful Run
+
+![GitHub Actions](2.png)
+
+### 3. Google Sheets – Job Data
+
+![Google Sheets](3.png)
