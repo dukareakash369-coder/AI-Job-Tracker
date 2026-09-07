@@ -1,4 +1,4 @@
-# AI Job Tracker – V1 🚀
+# AI Job Tracker – V1.1 🚀
 
 > An automated job discovery and tracking system for entry-level Embedded, AI, IoT and Robotics opportunities.
 
@@ -262,7 +262,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON
 
 ### 4. Project Architecture
 
-![Google Sheets](./4.png)
+![AI Job Tracker V1 Architecture](./4.png)
 
 ---
 
@@ -345,4 +345,4 @@ Interested in:
 
 > Automate repetitive job discovery, identify relevant opportunities, and maintain a structured job-tracking workflow.
 
-**AI Job Tracker V1 — Automate the Search. Focus on the Opportunity. 🚀**
+**AI Job Tracker V1.1 — Automate the Search. Focus on the Opportunity. 🚀**
