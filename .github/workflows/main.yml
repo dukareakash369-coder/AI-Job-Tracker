@@ -22,6 +22,12 @@ jobs:
         run: |
           pip install requests gspread google-auth
 
+      - name: Test Gemini API
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python gemini_test.py
+
       - name: Run Job Tracker
         env:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
