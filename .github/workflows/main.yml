@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests gspread google-auth
+          pip install requests gspread google-auth google-genai
 
       - name: Test Gemini API
         env:
