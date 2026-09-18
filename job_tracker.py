@@ -1,14 +1,16 @@
 import os
 import json
 import re
+import time
 from datetime import date
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from google import genai
 
 
-print("AI Job Tracker V1.1 Started!")
+print("AI Job Tracker V2 Started!")
 
 
 # =========================================================
@@ -24,7 +26,45 @@ if not APP_ID or not APP_KEY:
 
 
 # =========================================================
-# 2. GOOGLE SHEETS CREDENTIALS
+# 2. GEMINI API
+# =========================================================
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    print("ERROR: GEMINI_API_KEY not found.")
+    exit(1)
+
+try:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    print("Gemini client initialized successfully!")
+
+except Exception as error:
+    print("Gemini initialization error:", error)
+    exit(1)
+
+
+# =========================================================
+# 3. LOAD CANDIDATE PROFILE
+# =========================================================
+
+PROFILE_FILE = "profile.json"
+
+try:
+
+    with open(PROFILE_FILE, "r", encoding="utf-8") as file:
+        profile = json.load(file)
+
+    print("Candidate profile loaded successfully!")
+
+except Exception as error:
+
+    print("Profile loading error:", error)
+    exit(1)
+
+
+# =========================================================
+# 4. GOOGLE SHEETS CREDENTIALS
 # =========================================================
 
 GOOGLE_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -39,7 +79,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+
 try:
+
     service_account_info = json.loads(GOOGLE_JSON)
 
     credentials = Credentials.from_service_account_info(
@@ -50,31 +92,76 @@ try:
     gc = gspread.authorize(credentials)
 
 except Exception as error:
+
     print("Google authentication error:", error)
     exit(1)
 
 
 # =========================================================
-# 3. GOOGLE SHEET
+# 5. GOOGLE SHEET
 # =========================================================
 
 SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 
 WORKSHEET_NAME = "Sheet1"
 
+
 try:
+
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 except Exception as error:
+
     print("Google Sheet connection error:", error)
     exit(1)
+
 
 print("Google Sheet connected successfully!")
 
 
 # =========================================================
-# 4. SEARCH QUERIES
+# 6. GOOGLE SHEET HEADERS
+# =========================================================
+
+headers = [
+    "Date",
+    "Company",
+    "Job Role",
+    "Location",
+    "Salary",
+    "Experience",
+    "Skills",
+    "Match Score",
+    "Apply Link",
+    "Status",
+    "Matched Skills",
+    "Missing Skills",
+    "Experience Match",
+    "Match Reason"
+]
+
+
+try:
+
+    current_headers = worksheet.row_values(1)
+
+    if current_headers != headers:
+
+        worksheet.update(
+            "A1:N1",
+            [headers]
+        )
+
+        print("Google Sheet headers updated for V2!")
+
+except Exception as error:
+
+    print("Could not update Sheet headers:", error)
+
+
+# =========================================================
+# 7. SEARCH QUERIES
 # =========================================================
 
 search_queries = [
@@ -93,7 +180,7 @@ search_queries = [
 
 
 # =========================================================
-# 5. TARGET LOCATIONS
+# 8. TARGET LOCATIONS
 # =========================================================
 
 locations = [
@@ -103,7 +190,7 @@ locations = [
 
 
 # =========================================================
-# 6. REJECT WORDS
+# 9. BASIC REJECT WORDS
 # =========================================================
 
 reject_words = [
@@ -120,7 +207,7 @@ reject_words = [
 
 
 # =========================================================
-# 7. FRESHER / ENTRY LEVEL WORDS
+# 10. FRESHER / ENTRY LEVEL WORDS
 # =========================================================
 
 fresher_words = [
@@ -141,30 +228,31 @@ fresher_words = [
 
 
 # =========================================================
-# 8. ENTC / ELECTRONICS RELEVANCE KEYWORDS
+# 11. API SETTINGS
 # =========================================================
 
-entc_keywords = [
-    "electronics",
-    "telecommunication",
-    "telecom",
-    "microcontroller",
-    "microprocessor",
-    "pcb",
-    "circuit design",
-    "hardware",
-    "uart",
-    "spi",
-    "i2c",
-    "can bus",
-    "rf",
-    "analog electronics",
-    "digital electronics"
-]
+API_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
+
+RESULTS_PER_PAGE = 20
+
+TOTAL_PAGES = 3
 
 
 # =========================================================
-# 9. GET EXISTING APPLY LINKS
+# 12. AI SETTINGS
+# =========================================================
+
+AI_MODEL = "gemini-3.6-flash"
+
+AI_MIN_SCORE = 60
+
+MAX_AI_JOBS = 40
+
+ai_jobs_processed = 0
+
+
+# =========================================================
+# 13. GET EXISTING APPLY LINKS
 # =========================================================
 
 try:
@@ -174,6 +262,7 @@ try:
     existing_links = set()
 
     # Apply Link = Column I = index 8
+
     for row in existing_rows[1:]:
 
         if len(row) > 8:
@@ -198,27 +287,132 @@ except Exception as error:
 
 
 # =========================================================
-# 10. API SETTINGS
-# =========================================================
-
-API_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
-
-RESULTS_PER_PAGE = 20
-
-TOTAL_PAGES = 3
-
-
-# =========================================================
-# 11. TOTAL COUNTERS
+# 14. TOTAL COUNTERS
 # =========================================================
 
 total_added = 0
 total_seen = 0
 total_rejected = 0
+total_ai_analyzed = 0
 
 
 # =========================================================
-# 12. SEARCH JOBS
+# 15. GEMINI JOB ANALYSIS FUNCTION
+# =========================================================
+
+def analyze_job_with_gemini(
+    title,
+    company,
+    location,
+    description
+):
+
+    profile_text = json.dumps(
+        profile,
+        indent=2,
+        ensure_ascii=False
+    )
+
+
+    prompt = f"""
+You are an intelligent job matching system.
+
+Your task is to compare a candidate profile with a job description.
+
+CANDIDATE PROFILE:
+{profile_text}
+
+
+JOB INFORMATION:
+
+Company:
+{company}
+
+Job Role:
+{title}
+
+Location:
+{location}
+
+Job Description:
+{description}
+
+
+Analyze the job against the candidate profile.
+
+Important rules:
+
+1. Focus on the candidate being a FRESHER / ENTRY LEVEL candidate.
+2. Consider required technical skills.
+3. Consider programming languages.
+4. Consider embedded systems skills.
+5. Consider electronics and communication skills.
+6. Consider IoT and robotics skills.
+7. Consider location.
+8. Consider required experience.
+9. Do not assume the candidate has skills that are not present in the profile.
+10. Missing skills should be identified clearly.
+11. Match score must be between 0 and 100.
+12. Give a realistic score, not an artificially high score.
+13. If the job clearly requires senior-level experience, score it low.
+14. Return ONLY valid JSON.
+15. Do not use markdown.
+16. Do not include ```json or ```.
+
+Return exactly this JSON structure:
+
+{{
+    "match_score": 0,
+    "matched_skills": [],
+    "missing_skills": [],
+    "experience_match": "",
+    "match_reason": ""
+}}
+
+Keep match_reason short and practical.
+"""
+
+
+    try:
+
+        interaction = gemini_client.interactions.create(
+            model=AI_MODEL,
+            input=prompt
+        )
+
+        response_text = interaction.output_text.strip()
+
+        # Remove accidental markdown fences
+
+        response_text = re.sub(
+            r"^```json\s*",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        )
+
+        response_text = re.sub(
+            r"\s*```$",
+            "",
+            response_text
+        )
+
+        result = json.loads(response_text)
+
+        return result
+
+    except Exception as error:
+
+        print(
+            "Gemini analysis error:",
+            error
+        )
+
+        return None
+
+
+# =========================================================
+# 16. SEARCH JOBS
 # =========================================================
 
 for location in locations:
@@ -230,11 +424,18 @@ for location in locations:
         print(f"Location: {location}")
         print("=" * 70)
 
+
         for page in range(1, TOTAL_PAGES + 1):
 
-            print(f"Fetching page {page}...")
+            print(
+                f"Fetching page {page}..."
+            )
 
-            url = API_URL.format(page=page)
+
+            url = API_URL.format(
+                page=page
+            )
+
 
             params = {
                 "app_id": APP_ID,
@@ -244,6 +445,7 @@ for location in locations:
                 "results_per_page": RESULTS_PER_PAGE,
                 "content-type": "application/json"
             }
+
 
             try:
 
@@ -255,7 +457,11 @@ for location in locations:
 
             except requests.RequestException as error:
 
-                print("Request Error:", error)
+                print(
+                    "Request Error:",
+                    error
+                )
+
                 continue
 
 
@@ -266,7 +472,9 @@ for location in locations:
                     response.status_code
                 )
 
-                print(response.text[:500])
+                print(
+                    response.text[:500]
+                )
 
                 continue
 
@@ -277,11 +485,18 @@ for location in locations:
 
             except ValueError:
 
-                print("Invalid JSON response.")
+                print(
+                    "Invalid JSON response."
+                )
+
                 continue
 
 
-            jobs = data.get("results", [])
+            jobs = data.get(
+                "results",
+                []
+            )
+
 
             print(
                 f"Jobs received: {len(jobs)}"
@@ -289,12 +504,13 @@ for location in locations:
 
 
             # =================================================
-            # 13. PROCESS EACH JOB
+            # 17. PROCESS EACH JOB
             # =================================================
 
             for job in jobs:
 
                 total_seen += 1
+
 
                 title = job.get(
                     "title",
@@ -315,10 +531,12 @@ for location in locations:
                     {}
                 )
 
+
                 company = company_data.get(
                     "display_name",
                     "Not specified"
                 )
+
 
                 if not company:
                     company = "Not specified"
@@ -333,10 +551,12 @@ for location in locations:
                     {}
                 )
 
+
                 job_location = location_data.get(
                     "display_name",
                     location
                 )
+
 
                 if not job_location:
                     job_location = location
@@ -351,6 +571,7 @@ for location in locations:
                     ""
                 )
 
+
                 text = (
                     title
                     + " "
@@ -359,7 +580,7 @@ for location in locations:
 
 
                 # =================================================
-                # 14. REJECT SENIOR ROLES
+                # 18. BASIC SENIOR FILTER
                 # =================================================
 
                 if any(
@@ -378,7 +599,7 @@ for location in locations:
 
 
                 # =================================================
-                # 15. EXPERIENCE FILTER
+                # 19. EXPERIENCE FILTER
                 # =================================================
 
                 high_experience = re.search(
@@ -393,6 +614,7 @@ for location in locations:
                         high_experience.group(1)
                     )
 
+
                     if required_years >= 3:
 
                         total_rejected += 1
@@ -405,169 +627,221 @@ for location in locations:
                         continue
 
 
-                is_fresher = any(
-                    word in text
-                    for word in fresher_words
+                # =================================================
+                # 20. APPLY LINK
+                # =================================================
+
+                apply_link = job.get(
+                    "redirect_url",
+                    ""
                 )
 
 
-                # =================================================
-                # 16. MATCH SCORE
-                # =================================================
-
-                score = 35
-
-
-                # -------------------------------------------------
-                # Fresher / Entry-level
-                # -------------------------------------------------
-
-                if is_fresher:
-                    score += 20
-
-
-                # -------------------------------------------------
-                # C / C++
-                # -------------------------------------------------
-
-                if (
-                    "c programming" in text
-                    or "c language" in text
-                    or "c/c++" in text
-                    or "c++" in text
-                ):
-                    score += 10
-
-
-                # -------------------------------------------------
-                # Python
-                # -------------------------------------------------
-
-                if "python" in text:
-                    score += 5
-
-
-                # -------------------------------------------------
-                # Embedded
-                # -------------------------------------------------
-
-                if "embedded" in text:
-                    score += 10
-
-
-                # -------------------------------------------------
-                # ESP32 / STM32
-                # -------------------------------------------------
-
-                if (
-                    "esp32" in text
-                    or "stm32" in text
-                ):
-                    score += 5
-
-
-                # -------------------------------------------------
-                # IoT
-                # -------------------------------------------------
-
-                if "iot" in text:
-                    score += 5
-
-
-                # -------------------------------------------------
-                # Robotics
-                # -------------------------------------------------
-
-                if (
-                    "robotics" in text
-                    or "ros" in text
-                ):
-                    score += 5
-
-
-                # -------------------------------------------------
-                # Linux
-                # -------------------------------------------------
-
-                if "linux" in text:
-                    score += 3
-
-
-                # -------------------------------------------------
-                # RTOS
-                # -------------------------------------------------
-
-                if "rtos" in text:
-                    score += 3
-
-
-                # -------------------------------------------------
-                # ENTC / Electronics Relevance
-                # -------------------------------------------------
-
-                entc_matches = []
-
-                for keyword in entc_keywords:
-
-                    if keyword in text:
-
-                        entc_matches.append(keyword)
-
-                        score += 2
-
-
-                # -------------------------------------------------
-                # Pune Priority
-                # -------------------------------------------------
-
-                if "pune" in job_location.lower():
-                    score += 5
-
-
-                # -------------------------------------------------
-                # Remote Priority
-                # -------------------------------------------------
-
-                if "remote" in job_location.lower():
-                    score += 5
-
-
-                # -------------------------------------------------
-                # Maximum Score = 100
-                # -------------------------------------------------
-
-                if score > 100:
-                    score = 100
+                if not apply_link:
+                    continue
 
 
                 # =================================================
-                # 17. MINIMUM SCORE
+                # 21. DUPLICATE CHECK
                 # =================================================
 
-                if score < 40:
-
-                    total_rejected += 1
+                if apply_link in existing_links:
 
                     print(
-                        "Rejected low score:",
-                        title,
-                        score
+                        "Skipping duplicate:",
+                        title
                     )
 
                     continue
 
 
                 # =================================================
-                # 18. SALARY
+                # 22. AI JOB LIMIT
+                # =================================================
+
+                if ai_jobs_processed >= MAX_AI_JOBS:
+
+                    print(
+                        "AI analysis limit reached:",
+                        MAX_AI_JOBS
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 23. GEMINI AI ANALYSIS
+                # =================================================
+
+                print("\n" + "-" * 70)
+
+                print(
+                    "Sending job to Gemini AI..."
+                )
+
+                print(
+                    "Job:",
+                    title
+                )
+
+                print(
+                    "Company:",
+                    company
+                )
+
+
+                ai_result = analyze_job_with_gemini(
+                    title,
+                    company,
+                    job_location,
+                    description
+                )
+
+
+                ai_jobs_processed += 1
+                total_ai_analyzed += 1
+
+
+                if ai_result is None:
+
+                    print(
+                        "AI analysis failed. Skipping job."
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 24. READ AI RESULT
+                # =================================================
+
+                try:
+
+                    ai_score = int(
+                        ai_result.get(
+                            "match_score",
+                            0
+                        )
+                    )
+
+                except (ValueError, TypeError):
+
+                    ai_score = 0
+
+
+                if ai_score < 0:
+                    ai_score = 0
+
+
+                if ai_score > 100:
+                    ai_score = 100
+
+
+                matched_skills = ai_result.get(
+                    "matched_skills",
+                    []
+                )
+
+
+                missing_skills = ai_result.get(
+                    "missing_skills",
+                    []
+                )
+
+
+                experience_match = ai_result.get(
+                    "experience_match",
+                    "Not specified"
+                )
+
+
+                match_reason = ai_result.get(
+                    "match_reason",
+                    "Not specified"
+                )
+
+
+                # =================================================
+                # 25. CONVERT AI ARRAYS TO TEXT
+                # =================================================
+
+                if isinstance(
+                    matched_skills,
+                    list
+                ):
+
+                    matched_skills_text = ", ".join(
+                        str(skill)
+                        for skill in matched_skills
+                    )
+
+                else:
+
+                    matched_skills_text = str(
+                        matched_skills
+                    )
+
+
+                if isinstance(
+                    missing_skills,
+                    list
+                ):
+
+                    missing_skills_text = ", ".join(
+                        str(skill)
+                        for skill in missing_skills
+                    )
+
+                else:
+
+                    missing_skills_text = str(
+                        missing_skills
+                    )
+
+
+                if not matched_skills_text:
+                    matched_skills_text = "None"
+
+
+                if not missing_skills_text:
+                    missing_skills_text = "None"
+
+
+                # =================================================
+                # 26. AI SCORE FILTER
+                # =================================================
+
+                if ai_score < AI_MIN_SCORE:
+
+                    total_rejected += 1
+
+                    print(
+                        "Rejected by AI:",
+                        title
+                    )
+
+                    print(
+                        "AI Match Score:",
+                        ai_score,
+                        "/100"
+                    )
+
+                    continue
+
+
+                # =================================================
+                # 27. SALARY
                 # =================================================
 
                 salary_min = job.get(
                     "salary_min"
                 )
 
+
                 salary_max = job.get(
                     "salary_max"
                 )
+
 
                 salary = "Not specified"
 
@@ -581,13 +855,16 @@ for location in locations:
 
 
                 # =================================================
-                # 19. EXPERIENCE TEXT
+                # 28. EXPERIENCE TEXT
                 # =================================================
 
                 experience = "Not specified"
 
 
-                if is_fresher:
+                if any(
+                    word in text
+                    for word in fresher_words
+                ):
 
                     experience = (
                         "Fresher / 0-2 years"
@@ -601,7 +878,7 @@ for location in locations:
 
 
                 # =================================================
-                # 20. SKILLS
+                # 29. SKILLS FROM JOB DESCRIPTION
                 # =================================================
 
                 skills = []
@@ -724,43 +1001,18 @@ for location in locations:
                         skills.append(skill)
 
 
-                skills_text = ", ".join(skills)
+                skills_text = ", ".join(
+                    skills
+                )
 
 
                 if not skills_text:
+
                     skills_text = "Not specified"
 
 
                 # =================================================
-                # 21. APPLY LINK
-                # =================================================
-
-                apply_link = job.get(
-                    "redirect_url",
-                    ""
-                )
-
-
-                if not apply_link:
-                    continue
-
-
-                # =================================================
-                # 22. DUPLICATE CHECK
-                # =================================================
-
-                if apply_link in existing_links:
-
-                    print(
-                        "Skipping duplicate:",
-                        title
-                    )
-
-                    continue
-
-
-                # =================================================
-                # 23. ADD TO GOOGLE SHEET
+                # 30. ADD TO GOOGLE SHEET
                 # =================================================
 
                 row = [
@@ -779,11 +1031,19 @@ for location in locations:
 
                     skills_text,
 
-                    score,
+                    ai_score,
 
                     apply_link,
 
-                    "Not Applied"
+                    "Not Applied",
+
+                    matched_skills_text,
+
+                    missing_skills_text,
+
+                    experience_match,
+
+                    match_reason
                 ]
 
 
@@ -794,25 +1054,83 @@ for location in locations:
                         value_input_option="USER_ENTERED"
                     )
 
+
                     existing_links.add(
                         apply_link
                     )
 
+
                     total_added += 1
 
 
-                    print("\n" + "-" * 70)
-                    print("NEW JOB ADDED")
-                    print("Job:", title)
-                    print("Company:", company)
-                    print("Location:", job_location)
-                    print("Salary:", salary)
-                    print("Experience:", experience)
-                    print("Skills:", skills_text)
-                    print("ENTC Matches:", ", ".join(entc_matches) if entc_matches else "None")
-                    print("Match Score:", score, "/100")
-                    print("Apply:", apply_link)
-                    print("-" * 70)
+                    print("\n" + "=" * 70)
+
+                    print(
+                        "🎯 NEW AI-MATCHED JOB ADDED"
+                    )
+
+                    print(
+                        "Job:",
+                        title
+                    )
+
+                    print(
+                        "Company:",
+                        company
+                    )
+
+                    print(
+                        "Location:",
+                        job_location
+                    )
+
+                    print(
+                        "Salary:",
+                        salary
+                    )
+
+                    print(
+                        "Experience:",
+                        experience
+                    )
+
+                    print(
+                        "Skills:",
+                        skills_text
+                    )
+
+                    print(
+                        "Matched Skills:",
+                        matched_skills_text
+                    )
+
+                    print(
+                        "Missing Skills:",
+                        missing_skills_text
+                    )
+
+                    print(
+                        "Experience Match:",
+                        experience_match
+                    )
+
+                    print(
+                        "AI Match Score:",
+                        ai_score,
+                        "/100"
+                    )
+
+                    print(
+                        "Reason:",
+                        match_reason
+                    )
+
+                    print(
+                        "Apply:",
+                        apply_link
+                    )
+
+                    print("=" * 70)
 
 
                 except Exception as error:
@@ -823,8 +1141,13 @@ for location in locations:
                     )
 
 
+                # Small delay between Gemini requests
+
+                time.sleep(1)
+
+
 # =========================================================
-# 24. FINAL SUMMARY
+# 31. FINAL SUMMARY
 # =========================================================
 
 print("\n" + "=" * 70)
@@ -838,7 +1161,11 @@ print(
 )
 
 print(
-    f"New jobs added: {total_added}"
+    f"Jobs analyzed by Gemini: {total_ai_analyzed}"
+)
+
+print(
+    f"New AI-matched jobs added: {total_added}"
 )
 
 print(
@@ -848,5 +1175,5 @@ print(
 print("=" * 70)
 
 print(
-    "AI Job Tracker V1.1 Finished Successfully!"
+    "AI Job Tracker V2 Finished Successfully!"
 )
