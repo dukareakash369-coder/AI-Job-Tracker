@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 from google import genai
 
 
-print("AI Job Tracker V2 Started!")
+print("AI Job Tracker V2.1 Started!")
 
 
 # =========================================================
@@ -51,14 +51,12 @@ except Exception as error:
 PROFILE_FILE = "profile.json"
 
 try:
-
     with open(PROFILE_FILE, "r", encoding="utf-8") as file:
         profile = json.load(file)
 
     print("Candidate profile loaded successfully!")
 
 except Exception as error:
-
     print("Profile loading error:", error)
     exit(1)
 
@@ -81,7 +79,6 @@ SCOPES = [
 
 
 try:
-
     service_account_info = json.loads(GOOGLE_JSON)
 
     credentials = Credentials.from_service_account_info(
@@ -92,7 +89,6 @@ try:
     gc = gspread.authorize(credentials)
 
 except Exception as error:
-
     print("Google authentication error:", error)
     exit(1)
 
@@ -107,12 +103,10 @@ WORKSHEET_NAME = "Sheet1"
 
 
 try:
-
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 except Exception as error:
-
     print("Google Sheet connection error:", error)
     exit(1)
 
@@ -149,11 +143,11 @@ try:
     if current_headers != headers:
 
         worksheet.update(
-            "A1:N1",
-            [headers]
+            range_name="A1:N1",
+            values=[headers]
         )
 
-        print("Google Sheet headers updated for V2!")
+        print("Google Sheet headers updated for V2.1!")
 
 except Exception as error:
 
@@ -190,10 +184,16 @@ locations = [
 
 
 # =========================================================
-# 9. BASIC REJECT WORDS
+# 9. TITLE-BASED SENIOR REJECT WORDS
 # =========================================================
+#
+# IMPORTANT:
+# These words are checked mainly in the JOB TITLE.
+# We do NOT reject a job just because "senior", "lead",
+# etc. appears somewhere in the description.
+#
 
-reject_words = [
+reject_title_words = [
     "senior",
     "sr.",
     "sr ",
@@ -202,7 +202,9 @@ reject_words = [
     "principal",
     "architect",
     "director",
-    "head of"
+    "head of",
+    "vice president",
+    "vp "
 ]
 
 
@@ -223,7 +225,10 @@ fresher_words = [
     "0 to 1 years",
     "0 to 2 years",
     "1-2 years",
-    "1 to 2 years"
+    "1 to 2 years",
+    "0–1 years",
+    "0–2 years",
+    "1–2 years"
 ]
 
 
@@ -244,15 +249,26 @@ TOTAL_PAGES = 3
 
 AI_MODEL = "gemini-3.6-flash"
 
+# Only jobs with AI score >= 60 will be added.
 AI_MIN_SCORE = 60
 
+# Maximum NEW jobs sent to Gemini in one workflow.
 MAX_AI_JOBS = 40
 
 ai_jobs_processed = 0
 
 
 # =========================================================
-# 13. GET EXISTING APPLY LINKS
+# 13. API RETRY SETTINGS
+# =========================================================
+
+MAX_API_RETRIES = 3
+
+RETRY_DELAY_SECONDS = 3
+
+
+# =========================================================
+# 14. GET EXISTING APPLY LINKS
 # =========================================================
 
 try:
@@ -287,17 +303,19 @@ except Exception as error:
 
 
 # =========================================================
-# 14. TOTAL COUNTERS
+# 15. TOTAL COUNTERS
 # =========================================================
 
 total_added = 0
 total_seen = 0
 total_rejected = 0
 total_ai_analyzed = 0
+total_duplicates = 0
+total_api_errors = 0
 
 
 # =========================================================
-# 15. GEMINI JOB ANALYSIS FUNCTION
+# 16. GEMINI JOB ANALYSIS FUNCTION
 # =========================================================
 
 def analyze_job_with_gemini(
@@ -317,7 +335,7 @@ def analyze_job_with_gemini(
     prompt = f"""
 You are an intelligent job matching system.
 
-Your task is to compare a candidate profile with a job description.
+Compare the candidate profile with the job description.
 
 CANDIDATE PROFILE:
 {profile_text}
@@ -338,28 +356,29 @@ Job Description:
 {description}
 
 
-Analyze the job against the candidate profile.
+IMPORTANT MATCHING RULES:
 
-Important rules:
+1. The candidate is a FRESHER / ENTRY LEVEL Electronics and Telecommunication Engineering graduate.
+2. Do not assume skills that are not present in the candidate profile.
+3. Evaluate programming skills such as C, C++, and Python.
+4. Evaluate embedded systems skills.
+5. Evaluate electronics and communication skills.
+6. Evaluate IoT and robotics skills.
+7. Evaluate Linux, Git, UART, SPI, I2C and related technologies.
+8. Consider the candidate's existing projects and hardware-related skills.
+9. Consider required experience carefully.
+10. A job is not automatically unsuitable just because the description mentions senior engineers or senior-level concepts.
+11. Focus on the actual requirements of THIS job.
+12. If the job explicitly requires several years of professional experience, reflect that negatively.
+13. Missing specialized skills should reduce the score, but do not automatically make the score zero.
+14. Match score must be between 0 and 100.
+15. Be realistic.
+16. Return ONLY valid JSON.
+17. Do not return markdown.
+18. Do not use ```json.
+19. Keep the reason short and practical.
 
-1. Focus on the candidate being a FRESHER / ENTRY LEVEL candidate.
-2. Consider required technical skills.
-3. Consider programming languages.
-4. Consider embedded systems skills.
-5. Consider electronics and communication skills.
-6. Consider IoT and robotics skills.
-7. Consider location.
-8. Consider required experience.
-9. Do not assume the candidate has skills that are not present in the profile.
-10. Missing skills should be identified clearly.
-11. Match score must be between 0 and 100.
-12. Give a realistic score, not an artificially high score.
-13. If the job clearly requires senior-level experience, score it low.
-14. Return ONLY valid JSON.
-15. Do not use markdown.
-16. Do not include ```json or ```.
-
-Return exactly this JSON structure:
+Return EXACTLY this structure:
 
 {{
     "match_score": 0,
@@ -368,8 +387,6 @@ Return exactly this JSON structure:
     "experience_match": "",
     "match_reason": ""
 }}
-
-Keep match_reason short and practical.
 """
 
 
@@ -382,24 +399,47 @@ Keep match_reason short and practical.
 
         response_text = interaction.output_text.strip()
 
+
+        # -----------------------------------------------------
         # Remove accidental markdown fences
+        # -----------------------------------------------------
 
         response_text = re.sub(
-            r"^```json\s*",
+            r"```json",
             "",
             response_text,
             flags=re.IGNORECASE
         )
 
-        response_text = re.sub(
-            r"\s*```$",
-            "",
+        response_text = response_text.replace(
+            "```",
+            ""
+        ).strip()
+
+
+        # -----------------------------------------------------
+        # Try to extract JSON object
+        # -----------------------------------------------------
+
+        json_match = re.search(
+            r"\{.*\}",
+            response_text,
+            re.DOTALL
+        )
+
+
+        if json_match:
+
+            response_text = json_match.group(0)
+
+
+        result = json.loads(
             response_text
         )
 
-        result = json.loads(response_text)
 
         return result
+
 
     except Exception as error:
 
@@ -412,7 +452,123 @@ Keep match_reason short and practical.
 
 
 # =========================================================
-# 16. SEARCH JOBS
+# 17. FETCH ADZUNA PAGE WITH RETRY
+# =========================================================
+
+def fetch_adzuna_page(
+    page,
+    query,
+    location
+):
+
+    url = API_URL.format(
+        page=page
+    )
+
+
+    params = {
+        "app_id": APP_ID,
+        "app_key": APP_KEY,
+        "what": query,
+        "where": location,
+        "results_per_page": RESULTS_PER_PAGE,
+        "content-type": "application/json"
+    }
+
+
+    for attempt in range(
+        1,
+        MAX_API_RETRIES + 1
+    ):
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                timeout=30
+            )
+
+
+            if response.status_code == 200:
+
+                try:
+
+                    return response.json()
+
+                except ValueError:
+
+                    print(
+                        "Invalid JSON response."
+                    )
+
+                    return None
+
+
+            # -------------------------------------------------
+            # Retry temporary server errors
+            # -------------------------------------------------
+
+            if response.status_code in [
+                500,
+                502,
+                503,
+                504
+            ]:
+
+                print(
+                    f"Adzuna temporary error "
+                    f"{response.status_code}. "
+                    f"Retry {attempt}/{MAX_API_RETRIES}..."
+                )
+
+                if attempt < MAX_API_RETRIES:
+
+                    time.sleep(
+                        RETRY_DELAY_SECONDS * attempt
+                    )
+
+                    continue
+
+
+            print(
+                "API Error:",
+                response.status_code
+            )
+
+            print(
+                response.text[:500]
+            )
+
+            return None
+
+
+        except requests.RequestException as error:
+
+            print(
+                f"Request Error "
+                f"(attempt {attempt}/{MAX_API_RETRIES}):",
+                error
+            )
+
+
+            if attempt < MAX_API_RETRIES:
+
+                time.sleep(
+                    RETRY_DELAY_SECONDS * attempt
+                )
+
+                continue
+
+
+            return None
+
+
+    return None
+
+
+# =========================================================
+# 18. SEARCH JOBS
 # =========================================================
 
 for location in locations:
@@ -420,74 +576,48 @@ for location in locations:
     for query in search_queries:
 
         print("\n" + "=" * 70)
-        print(f"Searching: {query}")
-        print(f"Location: {location}")
+        print(
+            f"Searching: {query}"
+        )
+        print(
+            f"Location: {location}"
+        )
         print("=" * 70)
 
 
-        for page in range(1, TOTAL_PAGES + 1):
+        for page in range(
+            1,
+            TOTAL_PAGES + 1
+        ):
 
             print(
                 f"Fetching page {page}..."
             )
 
 
-            url = API_URL.format(
-                page=page
+            # -------------------------------------------------
+            # Stop requesting unnecessary pages after AI limit
+            # -------------------------------------------------
+
+            if ai_jobs_processed >= MAX_AI_JOBS:
+
+                print(
+                    "Maximum AI analysis limit reached."
+                )
+
+                break
+
+
+            data = fetch_adzuna_page(
+                page,
+                query,
+                location
             )
 
 
-            params = {
-                "app_id": APP_ID,
-                "app_key": APP_KEY,
-                "what": query,
-                "where": location,
-                "results_per_page": RESULTS_PER_PAGE,
-                "content-type": "application/json"
-            }
+            if data is None:
 
-
-            try:
-
-                response = requests.get(
-                    url,
-                    params=params,
-                    timeout=30
-                )
-
-            except requests.RequestException as error:
-
-                print(
-                    "Request Error:",
-                    error
-                )
-
-                continue
-
-
-            if response.status_code != 200:
-
-                print(
-                    "API Error:",
-                    response.status_code
-                )
-
-                print(
-                    response.text[:500]
-                )
-
-                continue
-
-
-            try:
-
-                data = response.json()
-
-            except ValueError:
-
-                print(
-                    "Invalid JSON response."
-                )
+                total_api_errors += 1
 
                 continue
 
@@ -504,7 +634,7 @@ for location in locations:
 
 
             # =================================================
-            # 17. PROCESS EACH JOB
+            # 19. PROCESS EACH JOB
             # =================================================
 
             for job in jobs:
@@ -539,6 +669,7 @@ for location in locations:
 
 
                 if not company:
+
                     company = "Not specified"
 
 
@@ -559,6 +690,7 @@ for location in locations:
 
 
                 if not job_location:
+
                     job_location = location
 
 
@@ -579,19 +711,31 @@ for location in locations:
                 ).lower()
 
 
+                title_lower = title.lower()
+
+
                 # =================================================
-                # 18. BASIC SENIOR FILTER
+                # 20. TITLE-BASED SENIOR FILTER
                 # =================================================
 
-                if any(
-                    word in text
-                    for word in reject_words
-                ):
+                title_rejected = False
+
+
+                for word in reject_title_words:
+
+                    if word in title_lower:
+
+                        title_rejected = True
+
+                        break
+
+
+                if title_rejected:
 
                     total_rejected += 1
 
                     print(
-                        "Rejected senior-level:",
+                        "Rejected senior/lead title:",
                         title
                     )
 
@@ -599,7 +743,7 @@ for location in locations:
 
 
                 # =================================================
-                # 19. EXPERIENCE FILTER
+                # 21. EXPERIENCE FILTER
                 # =================================================
 
                 high_experience = re.search(
@@ -620,7 +764,7 @@ for location in locations:
                         total_rejected += 1
 
                         print(
-                            "Rejected experience:",
+                            "Rejected 3+ years:",
                             title
                         )
 
@@ -628,7 +772,7 @@ for location in locations:
 
 
                 # =================================================
-                # 20. APPLY LINK
+                # 22. APPLY LINK
                 # =================================================
 
                 apply_link = job.get(
@@ -638,14 +782,17 @@ for location in locations:
 
 
                 if not apply_link:
+
                     continue
 
 
                 # =================================================
-                # 21. DUPLICATE CHECK
+                # 23. DUPLICATE CHECK
                 # =================================================
 
                 if apply_link in existing_links:
+
+                    total_duplicates += 1
 
                     print(
                         "Skipping duplicate:",
@@ -656,21 +803,31 @@ for location in locations:
 
 
                 # =================================================
-                # 22. AI JOB LIMIT
+                # 24. AI LIMIT
                 # =================================================
 
                 if ai_jobs_processed >= MAX_AI_JOBS:
 
                     print(
-                        "AI analysis limit reached:",
+                        "Maximum Gemini analysis limit reached:",
                         MAX_AI_JOBS
                     )
 
-                    continue
+                    break
 
 
                 # =================================================
-                # 23. GEMINI AI ANALYSIS
+                # 25. FRESHER DETECTION
+                # =================================================
+
+                is_fresher = any(
+                    word in text
+                    for word in fresher_words
+                )
+
+
+                # =================================================
+                # 26. SEND JOB TO GEMINI
                 # =================================================
 
                 print("\n" + "-" * 70)
@@ -687,6 +844,13 @@ for location in locations:
                 print(
                     "Company:",
                     company
+                )
+
+                print(
+                    "AI Analysis:",
+                    ai_jobs_processed + 1,
+                    "/",
+                    MAX_AI_JOBS
                 )
 
 
@@ -712,30 +876,42 @@ for location in locations:
 
 
                 # =================================================
-                # 24. READ AI RESULT
+                # 27. AI MATCH SCORE
                 # =================================================
+
+                raw_score = ai_result.get(
+                    "match_score",
+                    0
+                )
+
 
                 try:
 
                     ai_score = int(
-                        ai_result.get(
-                            "match_score",
-                            0
-                        )
+                        re.search(
+                            r"\d+",
+                            str(raw_score)
+                        ).group()
                     )
 
-                except (ValueError, TypeError):
+                except (AttributeError, ValueError):
 
                     ai_score = 0
 
 
                 if ai_score < 0:
+
                     ai_score = 0
 
 
                 if ai_score > 100:
+
                     ai_score = 100
 
+
+                # =================================================
+                # 28. AI MATCHED SKILLS
+                # =================================================
 
                 matched_skills = ai_result.get(
                     "matched_skills",
@@ -743,43 +919,37 @@ for location in locations:
                 )
 
 
-                missing_skills = ai_result.get(
-                    "missing_skills",
-                    []
-                )
-
-
-                experience_match = ai_result.get(
-                    "experience_match",
-                    "Not specified"
-                )
-
-
-                match_reason = ai_result.get(
-                    "match_reason",
-                    "Not specified"
-                )
-
-
-                # =================================================
-                # 25. CONVERT AI ARRAYS TO TEXT
-                # =================================================
-
                 if isinstance(
                     matched_skills,
                     list
                 ):
 
                     matched_skills_text = ", ".join(
-                        str(skill)
+                        str(skill).strip()
                         for skill in matched_skills
+                        if str(skill).strip()
                     )
 
                 else:
 
                     matched_skills_text = str(
                         matched_skills
-                    )
+                    ).strip()
+
+
+                if not matched_skills_text:
+
+                    matched_skills_text = "None"
+
+
+                # =================================================
+                # 29. AI MISSING SKILLS
+                # =================================================
+
+                missing_skills = ai_result.get(
+                    "missing_skills",
+                    []
+                )
 
 
                 if isinstance(
@@ -788,27 +958,65 @@ for location in locations:
                 ):
 
                     missing_skills_text = ", ".join(
-                        str(skill)
+                        str(skill).strip()
                         for skill in missing_skills
+                        if str(skill).strip()
                     )
 
                 else:
 
                     missing_skills_text = str(
                         missing_skills
-                    )
-
-
-                if not matched_skills_text:
-                    matched_skills_text = "None"
+                    ).strip()
 
 
                 if not missing_skills_text:
+
                     missing_skills_text = "None"
 
 
                 # =================================================
-                # 26. AI SCORE FILTER
+                # 30. EXPERIENCE MATCH
+                # =================================================
+
+                experience_match = ai_result.get(
+                    "experience_match",
+                    "Not specified"
+                )
+
+
+                experience_match = str(
+                    experience_match
+                ).strip()
+
+
+                if not experience_match:
+
+                    experience_match = "Not specified"
+
+
+                # =================================================
+                # 31. MATCH REASON
+                # =================================================
+
+                match_reason = ai_result.get(
+                    "match_reason",
+                    "Not specified"
+                )
+
+
+                match_reason = str(
+                    match_reason
+                ).strip()
+
+
+                if not match_reason:
+
+                    match_reason = "Not specified"
+
+
+                # =================================================
+                # 32. AI SCORE FILTER
                 # =================================================
 
                 if ai_score < AI_MIN_SCORE:
@@ -830,7 +1038,7 @@ for location in locations:
 
 
                 # =================================================
-                # 27. SALARY
+                # 33. SALARY
                 # =================================================
 
                 salary_min = job.get(
@@ -855,19 +1063,16 @@ for location in locations:
 
 
                 # =================================================
-                # 28. EXPERIENCE TEXT
+                # 34. EXPERIENCE TEXT
                 # =================================================
 
                 experience = "Not specified"
 
 
-                if any(
-                    word in text
-                    for word in fresher_words
-                ):
+                if is_fresher:
 
                     experience = (
-                        "Fresher / 0-2 years"
+                        "Fresher / Entry Level"
                     )
 
                 elif high_experience:
@@ -878,7 +1083,7 @@ for location in locations:
 
 
                 # =================================================
-                # 29. SKILLS FROM JOB DESCRIPTION
+                # 35. JOB SKILLS
                 # =================================================
 
                 skills = []
@@ -889,7 +1094,8 @@ for location in locations:
                     "C": [
                         "c programming",
                         "c language",
-                        "c/c++"
+                        "c/c++",
+                        "embedded c"
                     ],
 
                     "C++": [
@@ -912,12 +1118,21 @@ for location in locations:
                         "stm32"
                     ],
 
+                    "Arduino": [
+                        "arduino"
+                    ],
+
+                    "Raspberry Pi": [
+                        "raspberry pi"
+                    ],
+
                     "IoT": [
                         "iot"
                     ],
 
                     "Robotics": [
-                        "robotics"
+                        "robotics",
+                        "robotic"
                     ],
 
                     "ROS": [
@@ -929,7 +1144,13 @@ for location in locations:
                     ],
 
                     "RTOS": [
-                        "rtos"
+                        "rtos",
+                        "freertos"
+                    ],
+
+                    "Git": [
+                        "git",
+                        "github"
                     ],
 
                     "Electronics": [
@@ -970,23 +1191,41 @@ for location in locations:
                     ],
 
                     "I2C": [
-                        "i2c"
+                        "i2c",
+                        "i²c"
                     ],
 
                     "CAN Bus": [
-                        "can bus"
+                        "can bus",
+                        "can-bus"
+                    ],
+
+                    "LIN": [
+                        "lin protocol",
+                        "lin bus"
                     ],
 
                     "RF": [
                         "rf"
                     ],
 
-                    "Analog Electronics": [
-                        "analog electronics"
+                    "PWM": [
+                        "pwm"
                     ],
 
-                    "Digital Electronics": [
-                        "digital electronics"
+                    "GPIO": [
+                        "gpio"
+                    ],
+
+                    "Sensor Interfacing": [
+                        "sensor interfacing",
+                        "sensor integration"
+                    ],
+
+                    "Automotive": [
+                        "automotive",
+                        "ecu",
+                        "autosar"
                     ]
                 }
 
@@ -1012,7 +1251,7 @@ for location in locations:
 
 
                 # =================================================
-                # 30. ADD TO GOOGLE SHEET
+                # 36. ADD TO GOOGLE SHEET
                 # =================================================
 
                 row = [
@@ -1141,13 +1380,15 @@ for location in locations:
                     )
 
 
-                # Small delay between Gemini requests
+                # -------------------------------------------------
+                # Delay between Gemini requests
+                # -------------------------------------------------
 
-                time.sleep(1)
+                time.sleep(2)
 
 
 # =========================================================
-# 31. FINAL SUMMARY
+# 37. FINAL SUMMARY
 # =========================================================
 
 print("\n" + "=" * 70)
@@ -1169,11 +1410,19 @@ print(
 )
 
 print(
+    f"Duplicate jobs skipped: {total_duplicates}"
+)
+
+print(
     f"Jobs rejected: {total_rejected}"
+)
+
+print(
+    f"Adzuna API errors: {total_api_errors}"
 )
 
 print("=" * 70)
 
 print(
-    "AI Job Tracker V2 Finished Successfully!"
+    "AI Job Tracker V2.1 Finished Successfully!"
 )
