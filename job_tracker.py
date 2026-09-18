@@ -37,10 +37,16 @@ if not GEMINI_API_KEY:
 
 try:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
     print("Gemini client initialized successfully!")
 
 except Exception as error:
-    print("Gemini initialization error:", error)
+
+    print(
+        "Gemini initialization error:",
+        error
+    )
+
     exit(1)
 
 
@@ -51,13 +57,26 @@ except Exception as error:
 PROFILE_FILE = "profile.json"
 
 try:
-    with open(PROFILE_FILE, "r", encoding="utf-8") as file:
+
+    with open(
+        PROFILE_FILE,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
         profile = json.load(file)
 
-    print("Candidate profile loaded successfully!")
+    print(
+        "Candidate profile loaded successfully!"
+    )
 
 except Exception as error:
-    print("Profile loading error:", error)
+
+    print(
+        "Profile loading error:",
+        error
+    )
+
     exit(1)
 
 
@@ -65,10 +84,16 @@ except Exception as error:
 # 4. GOOGLE SHEETS CREDENTIALS
 # =========================================================
 
-GOOGLE_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_JSON = os.environ.get(
+    "GOOGLE_SERVICE_ACCOUNT_JSON"
+)
 
 if not GOOGLE_JSON:
-    print("ERROR: Google Service Account credentials not found.")
+
+    print(
+        "ERROR: Google Service Account credentials not found."
+    )
+
     exit(1)
 
 
@@ -79,17 +104,27 @@ SCOPES = [
 
 
 try:
-    service_account_info = json.loads(GOOGLE_JSON)
+
+    service_account_info = json.loads(
+        GOOGLE_JSON
+    )
 
     credentials = Credentials.from_service_account_info(
         service_account_info,
         scopes=SCOPES
     )
 
-    gc = gspread.authorize(credentials)
+    gc = gspread.authorize(
+        credentials
+    )
 
 except Exception as error:
-    print("Google authentication error:", error)
+
+    print(
+        "Google authentication error:",
+        error
+    )
+
     exit(1)
 
 
@@ -97,21 +132,36 @@ except Exception as error:
 # 5. GOOGLE SHEET
 # =========================================================
 
-SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
+SPREADSHEET_ID = (
+    "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
+)
 
 WORKSHEET_NAME = "Sheet1"
 
 
 try:
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+
+    spreadsheet = gc.open_by_key(
+        SPREADSHEET_ID
+    )
+
+    worksheet = spreadsheet.worksheet(
+        WORKSHEET_NAME
+    )
 
 except Exception as error:
-    print("Google Sheet connection error:", error)
+
+    print(
+        "Google Sheet connection error:",
+        error
+    )
+
     exit(1)
 
 
-print("Google Sheet connected successfully!")
+print(
+    "Google Sheet connected successfully!"
+)
 
 
 # =========================================================
@@ -147,11 +197,16 @@ try:
             values=[headers]
         )
 
-        print("Google Sheet headers updated for V2.1!")
+        print(
+            "Google Sheet headers updated for V2.1!"
+        )
 
 except Exception as error:
 
-    print("Could not update Sheet headers:", error)
+    print(
+        "Could not update Sheet headers:",
+        error
+    )
 
 
 # =========================================================
@@ -159,16 +214,27 @@ except Exception as error:
 # =========================================================
 
 search_queries = [
+
     "Embedded Engineer",
+
     "Embedded Software Engineer",
+
     "Embedded Systems Engineer",
+
     "Firmware Engineer",
+
     "Junior Embedded Engineer",
+
     "Embedded AI Engineer",
+
     "Edge AI Engineer",
+
     "IoT Engineer",
+
     "Junior IoT Engineer",
+
     "Robotics Engineer",
+
     "Junior Robotics Engineer"
 ]
 
@@ -186,14 +252,9 @@ locations = [
 # =========================================================
 # 9. TITLE-BASED SENIOR REJECT WORDS
 # =========================================================
-#
-# IMPORTANT:
-# These words are checked mainly in the JOB TITLE.
-# We do NOT reject a job just because "senior", "lead",
-# etc. appears somewhere in the description.
-#
 
 reject_title_words = [
+
     "senior",
     "sr.",
     "sr ",
@@ -213,21 +274,37 @@ reject_title_words = [
 # =========================================================
 
 fresher_words = [
+
     "fresher",
+
     "entry level",
+
     "entry-level",
+
     "junior",
+
     "trainee",
+
     "graduate",
+
     "intern",
+
     "0-1 years",
+
     "0-2 years",
+
     "0 to 1 years",
+
     "0 to 2 years",
+
     "1-2 years",
+
     "1 to 2 years",
+
     "0–1 years",
+
     "0–2 years",
+
     "1–2 years"
 ]
 
@@ -236,7 +313,9 @@ fresher_words = [
 # 11. API SETTINGS
 # =========================================================
 
-API_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
+API_URL = (
+    "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
+)
 
 RESULTS_PER_PAGE = 20
 
@@ -253,9 +332,18 @@ AI_MODEL = "gemini-3.6-flash"
 AI_MIN_SCORE = 60
 
 # Maximum NEW jobs sent to Gemini in one workflow.
-MAX_AI_JOBS = 40
+#
+# Reduced from 40 to 15 to avoid exhausting
+# the Gemini Free Tier too quickly.
+MAX_AI_JOBS = 15
 
 ai_jobs_processed = 0
+
+# This becomes True when Gemini returns HTTP 429.
+#
+# Once True, no more Gemini requests will be sent
+# during the current workflow run.
+gemini_rate_limited = False
 
 
 # =========================================================
@@ -286,6 +374,7 @@ try:
             link = row[8].strip()
 
             if link:
+
                 existing_links.add(link)
 
     print(
@@ -307,10 +396,15 @@ except Exception as error:
 # =========================================================
 
 total_added = 0
+
 total_seen = 0
+
 total_rejected = 0
+
 total_ai_analyzed = 0
+
 total_duplicates = 0
+
 total_api_errors = 0
 
 
@@ -324,6 +418,8 @@ def analyze_job_with_gemini(
     location,
     description
 ):
+
+    global gemini_rate_limited
 
     profile_text = json.dumps(
         profile,
@@ -359,23 +455,41 @@ Job Description:
 IMPORTANT MATCHING RULES:
 
 1. The candidate is a FRESHER / ENTRY LEVEL Electronics and Telecommunication Engineering graduate.
+
 2. Do not assume skills that are not present in the candidate profile.
+
 3. Evaluate programming skills such as C, C++, and Python.
+
 4. Evaluate embedded systems skills.
+
 5. Evaluate electronics and communication skills.
+
 6. Evaluate IoT and robotics skills.
+
 7. Evaluate Linux, Git, UART, SPI, I2C and related technologies.
+
 8. Consider the candidate's existing projects and hardware-related skills.
+
 9. Consider required experience carefully.
+
 10. A job is not automatically unsuitable just because the description mentions senior engineers or senior-level concepts.
+
 11. Focus on the actual requirements of THIS job.
+
 12. If the job explicitly requires several years of professional experience, reflect that negatively.
+
 13. Missing specialized skills should reduce the score, but do not automatically make the score zero.
+
 14. Match score must be between 0 and 100.
+
 15. Be realistic.
+
 16. Return ONLY valid JSON.
+
 17. Do not return markdown.
+
 18. Do not use ```json.
+
 19. Keep the reason short and practical.
 
 Return EXACTLY this structure:
@@ -397,7 +511,10 @@ Return EXACTLY this structure:
             input=prompt
         )
 
-        response_text = interaction.output_text.strip()
+
+        response_text = (
+            interaction.output_text.strip()
+        )
 
 
         # -----------------------------------------------------
@@ -430,7 +547,9 @@ Return EXACTLY this structure:
 
         if json_match:
 
-            response_text = json_match.group(0)
+            response_text = (
+                json_match.group(0)
+            )
 
 
         result = json.loads(
@@ -443,10 +562,53 @@ Return EXACTLY this structure:
 
     except Exception as error:
 
+        error_text = str(error)
+
+
+        # =====================================================
+        # GEMINI RATE LIMIT / HTTP 429
+        # =====================================================
+
+        if (
+            "429" in error_text
+            or
+            "rate limit" in error_text.lower()
+            or
+            "too_many_requests" in error_text.lower()
+        ):
+
+            gemini_rate_limited = True
+
+
+            print("\n" + "!" * 70)
+
+            print(
+                "⚠️ GEMINI RATE LIMIT REACHED"
+            )
+
+            print(
+                "Gemini AI analysis will STOP for this workflow."
+            )
+
+            print(
+                "No more Gemini requests will be sent."
+            )
+
+            print("!" * 70 + "\n")
+
+
+            return None
+
+
+        # =====================================================
+        # OTHER GEMINI ERRORS
+        # =====================================================
+
         print(
             "Gemini analysis error:",
             error
         )
+
 
         return None
 
@@ -467,11 +629,17 @@ def fetch_adzuna_page(
 
 
     params = {
+
         "app_id": APP_ID,
+
         "app_key": APP_KEY,
+
         "what": query,
+
         "where": location,
+
         "results_per_page": RESULTS_PER_PAGE,
+
         "content-type": "application/json"
     }
 
@@ -519,8 +687,10 @@ def fetch_adzuna_page(
                 print(
                     f"Adzuna temporary error "
                     f"{response.status_code}. "
-                    f"Retry {attempt}/{MAX_API_RETRIES}..."
+                    f"Retry "
+                    f"{attempt}/{MAX_API_RETRIES}..."
                 )
+
 
                 if attempt < MAX_API_RETRIES:
 
@@ -536,9 +706,11 @@ def fetch_adzuna_page(
                 response.status_code
             )
 
+
             print(
                 response.text[:500]
             )
+
 
             return None
 
@@ -547,7 +719,8 @@ def fetch_adzuna_page(
 
             print(
                 f"Request Error "
-                f"(attempt {attempt}/{MAX_API_RETRIES}):",
+                f"(attempt "
+                f"{attempt}/{MAX_API_RETRIES}):",
                 error
             )
 
@@ -575,14 +748,21 @@ for location in locations:
 
     for query in search_queries:
 
-        print("\n" + "=" * 70)
+        print(
+            "\n" + "=" * 70
+        )
+
         print(
             f"Searching: {query}"
         )
+
         print(
             f"Location: {location}"
         )
-        print("=" * 70)
+
+        print(
+            "=" * 70
+        )
 
 
         for page in range(
@@ -599,11 +779,27 @@ for location in locations:
             # Stop requesting unnecessary pages after AI limit
             # -------------------------------------------------
 
-            if ai_jobs_processed >= MAX_AI_JOBS:
+            if (
+                ai_jobs_processed >= MAX_AI_JOBS
+                or
+                gemini_rate_limited
+            ):
 
-                print(
-                    "Maximum AI analysis limit reached."
-                )
+                if gemini_rate_limited:
+
+                    print(
+                        "Gemini rate limit reached."
+                    )
+
+                    print(
+                        "Stopping further Gemini analysis."
+                    )
+
+                else:
+
+                    print(
+                        "Maximum AI analysis limit reached."
+                    )
 
                 break
 
@@ -649,6 +845,7 @@ for location in locations:
 
 
                 if not title:
+
                     continue
 
 
@@ -803,8 +1000,21 @@ for location in locations:
 
 
                 # =================================================
-                # 24. AI LIMIT
+                # 24. AI LIMIT / RATE LIMIT CHECK
                 # =================================================
+
+                if gemini_rate_limited:
+
+                    print(
+                        "Gemini rate limit already reached."
+                    )
+
+                    print(
+                        "Skipping remaining AI analysis."
+                    )
+
+                    break
+
 
                 if ai_jobs_processed >= MAX_AI_JOBS:
 
@@ -830,21 +1040,27 @@ for location in locations:
                 # 26. SEND JOB TO GEMINI
                 # =================================================
 
-                print("\n" + "-" * 70)
+                print(
+                    "\n" + "-" * 70
+                )
+
 
                 print(
                     "Sending job to Gemini AI..."
                 )
+
 
                 print(
                     "Job:",
                     title
                 )
 
+
                 print(
                     "Company:",
                     company
                 )
+
 
                 print(
                     "AI Analysis:",
@@ -863,8 +1079,30 @@ for location in locations:
 
 
                 ai_jobs_processed += 1
+
                 total_ai_analyzed += 1
 
+
+                # =================================================
+                # GEMINI RATE LIMIT HANDLING
+                # =================================================
+
+                if gemini_rate_limited:
+
+                    print(
+                        "Gemini quota/rate limit reached."
+                    )
+
+                    print(
+                        "Stopping further Gemini analysis."
+                    )
+
+                    break
+
+
+                # =================================================
+                # OTHER AI FAILURE
+                # =================================================
 
                 if ai_result is None:
 
@@ -894,7 +1132,11 @@ for location in locations:
                         ).group()
                     )
 
-                except (AttributeError, ValueError):
+
+                except (
+                    AttributeError,
+                    ValueError
+                ):
 
                     ai_score = 0
 
@@ -925,8 +1167,11 @@ for location in locations:
                 ):
 
                     matched_skills_text = ", ".join(
+
                         str(skill).strip()
+
                         for skill in matched_skills
+
                         if str(skill).strip()
                     )
 
@@ -958,8 +1203,11 @@ for location in locations:
                 ):
 
                     missing_skills_text = ", ".join(
+
                         str(skill).strip()
+
                         for skill in missing_skills
+
                         if str(skill).strip()
                     )
 
@@ -1028,11 +1276,13 @@ for location in locations:
                         title
                     )
 
+
                     print(
                         "AI Match Score:",
                         ai_score,
                         "/100"
                     )
+
 
                     continue
 
@@ -1057,7 +1307,9 @@ for location in locations:
                 if salary_min or salary_max:
 
                     salary = (
+
                         f"{salary_min or 'N/A'} - "
+
                         f"{salary_max or 'N/A'} per year"
                     )
 
@@ -1078,6 +1330,7 @@ for location in locations:
                 elif high_experience:
 
                     experience = (
+
                         f"{high_experience.group(1)}+ years"
                     )
 
@@ -1233,11 +1486,16 @@ for location in locations:
                 for skill, keywords in skill_keywords.items():
 
                     if any(
+
                         keyword in text
+
                         for keyword in keywords
+
                     ):
 
-                        skills.append(skill)
+                        skills.append(
+                            skill
+                        )
 
 
                 skills_text = ", ".join(
@@ -1289,8 +1547,11 @@ for location in locations:
                 try:
 
                     worksheet.append_row(
+
                         row,
+
                         value_input_option="USER_ENTERED"
+
                     )
 
 
@@ -1302,56 +1563,69 @@ for location in locations:
                     total_added += 1
 
 
-                    print("\n" + "=" * 70)
+                    print(
+                        "\n" + "=" * 70
+                    )
+
 
                     print(
                         "🎯 NEW AI-MATCHED JOB ADDED"
                     )
+
 
                     print(
                         "Job:",
                         title
                     )
 
+
                     print(
                         "Company:",
                         company
                     )
+
 
                     print(
                         "Location:",
                         job_location
                     )
 
+
                     print(
                         "Salary:",
                         salary
                     )
+
 
                     print(
                         "Experience:",
                         experience
                     )
 
+
                     print(
                         "Skills:",
                         skills_text
                     )
+
 
                     print(
                         "Matched Skills:",
                         matched_skills_text
                     )
 
+
                     print(
                         "Missing Skills:",
                         missing_skills_text
                     )
 
+
                     print(
                         "Experience Match:",
                         experience_match
                     )
+
 
                     print(
                         "AI Match Score:",
@@ -1359,17 +1633,22 @@ for location in locations:
                         "/100"
                     )
 
+
                     print(
                         "Reason:",
                         match_reason
                     )
+
 
                     print(
                         "Apply:",
                         apply_link
                     )
 
-                    print("=" * 70)
+
+                    print(
+                        "=" * 70
+                    )
 
 
                 except Exception as error:
@@ -1381,47 +1660,79 @@ for location in locations:
 
 
                 # -------------------------------------------------
-                # Delay between Gemini requests
+                # Delay between successful Gemini requests
                 # -------------------------------------------------
 
-                time.sleep(2)
+                if not gemini_rate_limited:
+
+                    time.sleep(2)
 
 
 # =========================================================
 # 37. FINAL SUMMARY
 # =========================================================
 
-print("\n" + "=" * 70)
+print(
+    "\n" + "=" * 70
+)
+
 
 print(
     "JOB SEARCH COMPLETED"
 )
 
+
 print(
     f"Total jobs seen: {total_seen}"
 )
+
 
 print(
     f"Jobs analyzed by Gemini: {total_ai_analyzed}"
 )
 
+
 print(
     f"New AI-matched jobs added: {total_added}"
 )
+
 
 print(
     f"Duplicate jobs skipped: {total_duplicates}"
 )
 
+
 print(
     f"Jobs rejected: {total_rejected}"
 )
+
 
 print(
     f"Adzuna API errors: {total_api_errors}"
 )
 
-print("=" * 70)
+
+if gemini_rate_limited:
+
+    print(
+        "Gemini status: RATE LIMIT REACHED"
+    )
+
+    print(
+        "Remaining jobs were not sent to Gemini."
+    )
+
+else:
+
+    print(
+        "Gemini status: Available"
+    )
+
+
+print(
+    "=" * 70
+)
+
 
 print(
     "AI Job Tracker V2.1 Finished Successfully!"
