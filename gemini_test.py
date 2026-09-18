@@ -1,5 +1,5 @@
 import os
-import requests
+from google import genai
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -7,31 +7,19 @@ if not API_KEY:
     print("ERROR: GEMINI_API_KEY not found.")
     exit(1)
 
-url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+client = genai.Client(api_key=API_KEY)
 
-headers = {
-    "Content-Type": "application/json",
-    "x-goog-api-key": API_KEY
-}
+try:
+    interaction = client.interactions.create(
+        model="gemini-3.6-flash",
+        input="In one sentence, explain what an Embedded Engineer does."
+    )
 
-data = {
-    "contents": [
-        {
-            "parts": [
-                {
-                    "text": "In one sentence, explain what an Embedded Engineer does."
-                }
-            ]
-        }
-    ]
-}
+    print("Status: 200")
+    print("Gemini Response:")
+    print(interaction.output_text)
 
-response = requests.post(
-    url,
-    headers=headers,
-    json=data,
-    timeout=30
-)
-
-print("Status:", response.status_code)
-print("Response:", response.text)
+except Exception as e:
+    print("Gemini API Error:")
+    print(e)
+    exit(1)
