@@ -70,7 +70,6 @@ except Exception as error:
     print("Google Sheet connection error:", error)
     exit(1)
 
-
 print("Google Sheet connected successfully!")
 
 
@@ -142,7 +141,30 @@ fresher_words = [
 
 
 # =========================================================
-# 8. GET EXISTING APPLY LINKS
+# 8. ENTC / ELECTRONICS RELEVANCE KEYWORDS
+# =========================================================
+
+entc_keywords = [
+    "electronics",
+    "telecommunication",
+    "telecom",
+    "microcontroller",
+    "microprocessor",
+    "pcb",
+    "circuit design",
+    "hardware",
+    "uart",
+    "spi",
+    "i2c",
+    "can bus",
+    "rf",
+    "analog electronics",
+    "digital electronics"
+]
+
+
+# =========================================================
+# 9. GET EXISTING APPLY LINKS
 # =========================================================
 
 try:
@@ -176,12 +198,10 @@ except Exception as error:
 
 
 # =========================================================
-# 9. API SETTINGS
+# 10. API SETTINGS
 # =========================================================
 
-API_URL = (
-    "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
-)
+API_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
 
 RESULTS_PER_PAGE = 20
 
@@ -189,7 +209,7 @@ TOTAL_PAGES = 3
 
 
 # =========================================================
-# 10. TOTAL COUNTERS
+# 11. TOTAL COUNTERS
 # =========================================================
 
 total_added = 0
@@ -198,7 +218,7 @@ total_rejected = 0
 
 
 # =========================================================
-# 11. SEARCH JOBS
+# 12. SEARCH JOBS
 # =========================================================
 
 for location in locations:
@@ -258,7 +278,6 @@ for location in locations:
             except ValueError:
 
                 print("Invalid JSON response.")
-
                 continue
 
 
@@ -270,7 +289,7 @@ for location in locations:
 
 
             # =================================================
-            # 12. PROCESS EACH JOB
+            # 13. PROCESS EACH JOB
             # =================================================
 
             for job in jobs:
@@ -332,7 +351,6 @@ for location in locations:
                     ""
                 )
 
-
                 text = (
                     title
                     + " "
@@ -341,7 +359,7 @@ for location in locations:
 
 
                 # =================================================
-                # 13. REJECT SENIOR ROLES
+                # 14. REJECT SENIOR ROLES
                 # =================================================
 
                 if any(
@@ -360,7 +378,7 @@ for location in locations:
 
 
                 # =================================================
-                # 14. EXPERIENCE FILTER
+                # 15. EXPERIENCE FILTER
                 # =================================================
 
                 high_experience = re.search(
@@ -394,18 +412,24 @@ for location in locations:
 
 
                 # =================================================
-                # 15. MATCH SCORE
+                # 16. MATCH SCORE
                 # =================================================
 
                 score = 35
 
 
-                # Fresher / entry-level
+                # -------------------------------------------------
+                # Fresher / Entry-level
+                # -------------------------------------------------
+
                 if is_fresher:
                     score += 20
 
 
+                # -------------------------------------------------
                 # C / C++
+                # -------------------------------------------------
+
                 if (
                     "c programming" in text
                     or "c language" in text
@@ -415,17 +439,26 @@ for location in locations:
                     score += 10
 
 
+                # -------------------------------------------------
                 # Python
+                # -------------------------------------------------
+
                 if "python" in text:
                     score += 5
 
 
+                # -------------------------------------------------
                 # Embedded
+                # -------------------------------------------------
+
                 if "embedded" in text:
                     score += 10
 
 
+                # -------------------------------------------------
                 # ESP32 / STM32
+                # -------------------------------------------------
+
                 if (
                     "esp32" in text
                     or "stm32" in text
@@ -433,12 +466,18 @@ for location in locations:
                     score += 5
 
 
+                # -------------------------------------------------
                 # IoT
+                # -------------------------------------------------
+
                 if "iot" in text:
                     score += 5
 
 
+                # -------------------------------------------------
                 # Robotics
+                # -------------------------------------------------
+
                 if (
                     "robotics" in text
                     or "ros" in text
@@ -446,36 +485,66 @@ for location in locations:
                     score += 5
 
 
+                # -------------------------------------------------
                 # Linux
+                # -------------------------------------------------
+
                 if "linux" in text:
                     score += 3
 
 
+                # -------------------------------------------------
                 # RTOS
+                # -------------------------------------------------
+
                 if "rtos" in text:
                     score += 3
 
 
-                # Pune priority
+                # -------------------------------------------------
+                # ENTC / Electronics Relevance
+                # -------------------------------------------------
+
+                entc_matches = []
+
+                for keyword in entc_keywords:
+
+                    if keyword in text:
+
+                        entc_matches.append(keyword)
+
+                        score += 2
+
+
+                # -------------------------------------------------
+                # Pune Priority
+                # -------------------------------------------------
+
                 if "pune" in job_location.lower():
                     score += 5
 
 
-                # Remote priority
+                # -------------------------------------------------
+                # Remote Priority
+                # -------------------------------------------------
+
                 if "remote" in job_location.lower():
                     score += 5
 
 
-                # Maximum 100
+                # -------------------------------------------------
+                # Maximum Score = 100
+                # -------------------------------------------------
+
                 if score > 100:
                     score = 100
 
 
                 # =================================================
-                # 16. MINIMUM SCORE
+                # 17. MINIMUM SCORE
                 # =================================================
 
-                if score < 55:
+                if score < 40:
 
                     total_rejected += 1
 
@@ -489,7 +558,7 @@ for location in locations:
 
 
                 # =================================================
-                # 17. SALARY
+                # 18. SALARY
                 # =================================================
 
                 salary_min = job.get(
@@ -512,7 +581,7 @@ for location in locations:
 
 
                 # =================================================
-                # 18. EXPERIENCE TEXT
+                # 19. EXPERIENCE TEXT
                 # =================================================
 
                 experience = "Not specified"
@@ -532,7 +601,7 @@ for location in locations:
 
 
                 # =================================================
-                # 19. SKILLS
+                # 20. SKILLS
                 # =================================================
 
                 skills = []
@@ -584,6 +653,63 @@ for location in locations:
 
                     "RTOS": [
                         "rtos"
+                    ],
+
+                    "Electronics": [
+                        "electronics"
+                    ],
+
+                    "Telecommunication": [
+                        "telecommunication",
+                        "telecom"
+                    ],
+
+                    "Microcontroller": [
+                        "microcontroller"
+                    ],
+
+                    "Microprocessor": [
+                        "microprocessor"
+                    ],
+
+                    "PCB": [
+                        "pcb"
+                    ],
+
+                    "Circuit Design": [
+                        "circuit design"
+                    ],
+
+                    "Hardware": [
+                        "hardware"
+                    ],
+
+                    "UART": [
+                        "uart"
+                    ],
+
+                    "SPI": [
+                        "spi"
+                    ],
+
+                    "I2C": [
+                        "i2c"
+                    ],
+
+                    "CAN Bus": [
+                        "can bus"
+                    ],
+
+                    "RF": [
+                        "rf"
+                    ],
+
+                    "Analog Electronics": [
+                        "analog electronics"
+                    ],
+
+                    "Digital Electronics": [
+                        "digital electronics"
                     ]
                 }
 
@@ -606,7 +732,7 @@ for location in locations:
 
 
                 # =================================================
-                # 20. APPLY LINK
+                # 21. APPLY LINK
                 # =================================================
 
                 apply_link = job.get(
@@ -620,7 +746,7 @@ for location in locations:
 
 
                 # =================================================
-                # 21. DUPLICATE CHECK
+                # 22. DUPLICATE CHECK
                 # =================================================
 
                 if apply_link in existing_links:
@@ -634,7 +760,7 @@ for location in locations:
 
 
                 # =================================================
-                # 22. ADD TO GOOGLE SHEET
+                # 23. ADD TO GOOGLE SHEET
                 # =================================================
 
                 row = [
@@ -683,6 +809,7 @@ for location in locations:
                     print("Salary:", salary)
                     print("Experience:", experience)
                     print("Skills:", skills_text)
+                    print("ENTC Matches:", ", ".join(entc_matches) if entc_matches else "None")
                     print("Match Score:", score, "/100")
                     print("Apply:", apply_link)
                     print("-" * 70)
@@ -697,7 +824,7 @@ for location in locations:
 
 
 # =========================================================
-# 23. FINAL SUMMARY
+# 24. FINAL SUMMARY
 # =========================================================
 
 print("\n" + "=" * 70)
