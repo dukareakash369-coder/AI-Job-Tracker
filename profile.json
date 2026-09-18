@@ -1,0 +1,60 @@
+{
+  "target_roles": [
+    "Embedded Engineer",
+    "Embedded Software Engineer",
+    "Embedded Systems Engineer",
+    "Firmware Engineer",
+    "Junior Embedded Engineer",
+    "Embedded AI Engineer",
+    "Edge AI Engineer",
+    "IoT Engineer",
+    "Junior IoT Engineer",
+    "Robotics Engineer",
+    "Junior Robotics Engineer"
+  ],
+  "education": {
+    "branch": "Electronics and Telecommunication Engineering"
+  },
+  "experience_level": "Fresher / Entry Level",
+  "preferred_locations": [
+    "Pune",
+    "Remote"
+  ],
+  "skills": {
+    "programming": [
+      "C",
+      "C++",
+      "Python"
+    ],
+    "embedded": [
+      "Embedded C",
+      "ESP32",
+      "Arduino",
+      "Raspberry Pi",
+      "Embedded Linux",
+      "GPIO",
+      "PWM",
+      "Sensor Interfacing",
+      "Hardware Debugging"
+    ],
+    "communication": [
+      "UART",
+      "SPI",
+      "I2C"
+    ],
+    "iot": [
+      "IoT",
+      "REST API"
+    ],
+    "robotics": [
+      "Robotics",
+      "ROS",
+      "Motor Control"
+    ],
+    "tools": [
+      "Git",
+      "GitHub",
+      "Linux"
+    ]
+  }
+}
