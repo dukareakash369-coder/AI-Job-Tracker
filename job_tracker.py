@@ -1,4 +1,4 @@
-# AI Job Tracker V2.3 - Gemini + Groq Stable
+# AI Job Tracker V2.3.1 - Gemini + Groq Stable
 # Gemini primary + Groq fallback
 #
 # V2.2.1 fixes:
@@ -10,6 +10,8 @@
 # 6) Cleaner final statistics and provider status
 # 7) Existing filtering / duplicate logic retained
 # 8) OpenRouter removed; Groq is the only fallback provider
+# 9) Company-name normalization improves duplicate detection (e.g. Cummins vs Cummins Inc.)
+# 10) Sheet header/version log updated to V2.3.1
 
 import os
 import re
@@ -821,13 +823,60 @@ def prepare_job(raw, location):
     }
 
 
+def normalize_company_name(value):
+    """Normalize company names for duplicate detection only.
+
+    This does NOT change the company name written to Google Sheets.
+    It only makes common legal suffix variations such as
+    "Cummins", "Cummins Inc.", and "Cummins Inc" compare equally.
+    """
+
+    name = normalize_key(value)
+
+    # Remove common company/legal suffixes from the END only.
+    # Repeating the pass handles combinations such as
+    # "Pvt Ltd" -> "Pvt" -> removed.
+    suffix_patterns = [
+        r"\bpvt\b",
+        r"\bprivate\b",
+        r"\blimited\b",
+        r"\bltd\b",
+        r"\bincorporated\b",
+        r"\binc\b",
+        r"\bcorporation\b",
+        r"\bcorp\b",
+        r"\bcompany\b",
+        r"\bco\b",
+        r"\bllc\b",
+        r"\bllp\b",
+    ]
+
+    changed = True
+
+    while name and changed:
+        changed = False
+
+        for pattern in suffix_patterns:
+            updated = re.sub(
+                rf"(?:\s+{pattern})$",
+                "",
+                name,
+            ).strip()
+
+            if updated != name:
+                name = updated
+                changed = True
+
+    return name
+
+
 def make_job_key(
     company,
     title,
     location,
 ):
     return (
-        normalize_key(company),
+        normalize_company_name(company),
         normalize_key(title),
         normalize_key(location),
     )
@@ -885,7 +934,7 @@ def update_headers(worksheet):
         )
 
         print(
-            "Google Sheet headers updated for V2.2.1!"
+            "Google Sheet headers verified for V2.3.1!"
         )
 
         return True
@@ -1157,7 +1206,7 @@ def main():
     global stop_ai_processing
 
     print("=" * 70)
-    print("AI Job Tracker V2.3 Started!")
+    print("AI Job Tracker V2.3.1 Started!")
     print(
         "Gemini PRIMARY + Groq FALLBACK"
     )
@@ -1581,7 +1630,7 @@ def main():
 
     print("=" * 70)
     print(
-        "AI Job Tracker V2.3 Finished!"
+        "AI Job Tracker V2.3.1 Finished!"
     )
     print("=" * 70)
 
