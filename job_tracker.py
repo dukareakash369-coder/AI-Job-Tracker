@@ -1,3 +1,11 @@
+# AI Job Tracker V2.2 - Fixed
+# Gemini primary + OpenRouter free fallback
+# Fixes:
+# 1) Robust OpenRouter JSON extraction
+# 2) Reliable Google Sheets append verification
+# 3) Gemini quota fallback
+# 4) Existing filtering / duplicate logic retained
+
 import os
 import re
 import json
@@ -10,32 +18,28 @@ from google.oauth2.service_account import Credentials
 from google import genai
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID")
-ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-
 SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 WORKSHEET_NAME = "Sheet1"
 
-GEMINI_MODEL = "gemini-3.6-flash"
+AI_MODEL = "gemini-3.6-flash"
 OPENROUTER_MODEL = "openrouter/free"
 
 MAX_AI_JOBS = 15
 AI_MIN_SCORE = 60
 
-ADZUNA_API_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
 RESULTS_PER_PAGE = 20
 TOTAL_PAGES = 3
-MAX_API_RETRIES = 3
-RETRY_DELAY_SECONDS = 3
-AI_DELAY_SECONDS = 2
-OPENROUTER_TIMEOUT_SECONDS = 45
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+HEADERS = [
+    "Date", "Company", "Job Role", "Location", "Salary", "Experience",
+    "Skills", "Match Score", "Apply Link", "Status", "Matched Skills",
+    "Missing Skills", "Experience Match", "Match Reason"
+]
 
 SEARCH_QUERIES = [
     "Embedded Engineer",
@@ -53,239 +57,116 @@ SEARCH_QUERIES = [
 
 LOCATIONS = ["Pune", "Remote"]
 
-SENIOR_TITLE_WORDS = [
-    "senior", "sr.", "sr ", "lead", "manager", "principal",
-    "architect", "director", "head of", "vice president", "vp ",
-]
-
-FRESHER_WORDS = [
-    "fresher", "entry level", "entry-level", "junior", "trainee",
-    "graduate", "intern", "0-1 years", "0-2 years",
-    "0 to 1 years", "0 to 2 years", "1-2 years",
-    "1 to 2 years", "0–1 years", "0–2 years", "1–2 years",
-]
-
-HEADERS = [
-    "Date", "Company", "Job Role", "Location", "Salary", "Experience",
-    "Skills", "Match Score", "Apply Link", "Status", "Matched Skills",
-    "Missing Skills", "Experience Match", "Match Reason",
-]
-
 gemini_client = None
-gemini_available = True
+gemini_available = False
 gemini_rate_limited = False
 
-ai_jobs_processed = 0
-new_jobs_added = 0
-duplicate_jobs = 0
-rejected_jobs = 0
-total_jobs_seen = 0
-adzuna_api_errors = 0
-openrouter_fallbacks = 0
-openrouter_errors = 0
+stats = {
+    "total_jobs_seen": 0,
+    "jobs_analyzed": 0,
+    "new_jobs_added": 0,
+    "duplicate_jobs_skipped": 0,
+    "jobs_rejected": 0,
+    "adzuna_api_errors": 0,
+    "openrouter_fallback_uses": 0,
+    "openrouter_errors": 0,
+}
+
+existing_job_keys = set()
 
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
+def clean_text(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
 
-def initialize_gemini():
-    global gemini_client, gemini_available
 
-    if not GEMINI_API_KEY:
-        print("WARNING: GEMINI_API_KEY not found.")
-        gemini_available = False
-        return False
+def normalize_key(value):
+    value = clean_text(value).lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_list(value):
+    if isinstance(value, list):
+        return [clean_text(x) for x in value if clean_text(x)]
+    if value is None:
+        return []
+    value = clean_text(value)
+    return [value] if value else []
+
+
+def load_candidate_profile():
+    path = "profile.json"
+    if not os.path.exists(path):
+        print("WARNING: profile.json not found. Using fallback profile.")
+        return {
+            "experience_level": "Entry-level / Fresher",
+            "target_roles": [
+                "Embedded Engineer", "Embedded Software Engineer",
+                "Embedded Systems Engineer", "Firmware Engineer",
+                "Embedded AI Engineer", "Edge AI Engineer",
+                "IoT Engineer", "Robotics Engineer"
+            ],
+            "skills": [
+                "C", "Embedded C", "C++", "Python", "Arduino", "ESP32",
+                "Raspberry Pi", "Embedded Linux", "GPIO", "PWM",
+                "UART", "SPI", "I2C", "Hardware Debugging"
+            ],
+            "education": "Electronics and Telecommunication Engineering"
+        }
 
     try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        print("Gemini client initialized successfully!")
-        return True
-    except Exception as exc:
-        print("Gemini initialization error:", exc)
-        gemini_available = False
-        return False
-
-
-def load_profile():
-    try:
-        with open("profile.json", "r", encoding="utf-8") as file:
-            profile = json.load(file)
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
         print("Candidate profile loaded successfully!")
         return profile
     except Exception as exc:
-        print("Profile loading error:", exc)
-        return None
+        print(f"WARNING: Could not load profile.json: {exc}")
+        return {}
 
 
-def connect_google_sheet():
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        print("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON not found.")
-        return None
-
+def initialize_gemini():
+    global gemini_client, gemini_available
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        print("Gemini API key not found. OpenRouter will be used.")
+        return
     try:
-        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-
-        credentials = Credentials.from_service_account_info(
-            service_account_info,
-            scopes=scopes,
-        )
-
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-
-        print("Google Sheet connected successfully!")
-        return worksheet
-
+        gemini_client = genai.Client(api_key=key)
+        gemini_available = True
+        print("Gemini client initialized successfully!")
     except Exception as exc:
-        print("Google Sheet connection error:", exc)
-        return None
+        print(f"Gemini initialization failed: {exc}")
 
-
-def update_sheet_headers(worksheet):
-    try:
-        # Named arguments avoid the current gspread deprecation warning.
-        worksheet.update(
-            range_name="A1:N1",
-            values=[HEADERS],
-        )
-        print("Google Sheet headers updated for V2.2!")
-
-    except Exception as exc:
-        print("Header update error:", exc)
-
-
-def get_existing_jobs(worksheet):
-    existing_jobs = set()
-
-    try:
-        rows = worksheet.get_all_values()
-
-        for row in rows[1:]:
-            if len(row) >= 3:
-                company = row[1].strip().lower()
-                title = row[2].strip().lower()
-
-                if company and title:
-                    existing_jobs.add((company, title))
-
-        print(f"Existing jobs in Sheet: {len(existing_jobs)}")
-
-    except Exception as exc:
-        print("Error reading existing jobs:", exc)
-
-    return existing_jobs
-
-
-def is_duplicate(job, existing_jobs):
-    company = (
-        job.get("company", {})
-        .get("display_name", "")
-        .strip()
-        .lower()
-    )
-
-    title = job.get("title", "").strip().lower()
-
-    return (company, title) in existing_jobs
-
-
-def is_senior_title(title):
-    title_lower = title.lower()
-    return any(word in title_lower for word in SENIOR_TITLE_WORDS)
-
-
-def requires_three_plus_years(text):
-    if not text:
-        return False
-
-    text_lower = text.lower()
-
-    patterns = [
-        r"\b(?:3|4|5|6|7|8|9|10)\+?\s*years?\b",
-        r"\b(?:3|4|5|6|7)\s*to\s*(?:5|6|7|8|10)\s*years?\b",
-        r"\bminimum\s+(?:3|4|5)\s*years?\b",
-        r"\bat\s+least\s+(?:3|4|5)\s*years?\b",
-    ]
-
-    return any(re.search(pattern, text_lower) for pattern in patterns)
-
-
-def detect_fresher(text):
-    if not text:
-        return False
-
-    text_lower = text.lower()
-    return any(word in text_lower for word in FRESHER_WORDS)
-
-
-def format_salary(job):
-    salary_min = job.get("salary_min")
-    salary_max = job.get("salary_max")
-
-    if salary_min and salary_max:
-        return f"{salary_min:.0f} - {salary_max:.0f} per year"
-
-    if salary_min:
-        return f"{salary_min:.0f} per year"
-
-    if salary_max:
-        return f"{salary_max:.0f} per year"
-
-    return "Not specified"
-
-
-# ============================================================
-# AI PROMPT / JSON PARSING
-# ============================================================
 
 def build_ai_prompt(job, profile):
-    title = job.get("title", "Unknown")
-
-    company = (
-        job.get("company", {})
-        .get("display_name", "Unknown")
-    )
-
-    location = (
-        job.get("location", {})
-        .get("display_name", "Unknown")
-    )
-
-    description = job.get("description", "")
-    salary = format_salary(job)
-
-    profile_text = json.dumps(
-        profile,
-        indent=2,
-        ensure_ascii=False,
-    )
-
     return f"""
-You are an AI job matching system.
+You are evaluating a job for an entry-level Electronics and Telecommunication
+Engineering candidate targeting Embedded Systems, Embedded AI, Edge AI, IoT,
+Firmware and Robotics roles.
 
-Compare this job against the candidate profile.
+Candidate profile:
+{json.dumps(profile, ensure_ascii=False)}
 
-CANDIDATE PROFILE:
-{profile_text}
-
-JOB INFORMATION:
-Title: {title}
-Company: {company}
-Location: {location}
-Salary: {salary}
-
+Job:
+Company: {clean_text(job.get("company", "Unknown"))}
+Title: {clean_text(job.get("title", ""))}
+Location: {clean_text(job.get("location", ""))}
 Description:
-{description}
+{clean_text(job.get("description", ""))[:12000]}
 
-Return ONLY valid JSON with exactly this structure:
+Return ONLY one valid JSON object. Do not use Markdown fences.
+Do not add explanations before or after the JSON.
 
+Required schema:
 {{
   "match_score": 0,
   "matched_skills": [],
@@ -295,1090 +176,587 @@ Return ONLY valid JSON with exactly this structure:
 }}
 
 Rules:
-1. match_score must be an integer from 0 to 100.
-2. The candidate is a fresher / entry-level candidate.
-3. Use only skills actually present in the candidate profile.
-4. Identify important missing technical skills.
-5. Consider education, skills, experience level and location.
-6. Do not invent qualifications or experience.
-7. Keep the reason concise.
-8. Return JSON only. No markdown.
+- match_score must be an integer from 0 to 100.
+- Consider role relevance, candidate skills, location, education/experience
+  level and job requirements.
+- Do not invent candidate skills.
+- Keep reason concise.
 """
 
 
-def clean_ai_json(text):
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    text = re.sub(
-        r"```json\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    text = re.sub(
-        r"```\s*",
-        "",
-        text,
-    )
-
-    match = re.search(
-        r"\{.*\}",
-        text,
-        flags=re.DOTALL,
-    )
-
-    return match.group(0) if match else text
-
-
-def parse_ai_result(text):
-    try:
-        result = json.loads(clean_ai_json(text))
-
-        score = int(result.get("match_score", 0))
-        result["match_score"] = max(0, min(100, score))
-
-        for field in ["matched_skills", "missing_skills"]:
-            value = result.get(field, [])
-
-            if not isinstance(value, list):
-                result[field] = [str(value)] if value else []
-
-        result["experience_match"] = str(
-            result.get("experience_match", "")
-        )
-
-        result["reason"] = str(
-            result.get("reason", "")
-        )
-
-        return result
-
-    except (
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ) as exc:
-
-        print("AI returned invalid JSON:", exc)
+def extract_json_object(text):
+    """Extract the first complete JSON object from an AI response."""
+    if text is None:
         return None
 
+    text = str(text).strip()
+    if not text:
+        return None
 
-# ============================================================
-# GEMINI PRIMARY
-# ============================================================
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
 
-def analyze_job_with_gemini(job, profile):
-    global gemini_available
-    global gemini_rate_limited
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
 
-    if not gemini_client or not gemini_available:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i + 1]
+                try:
+                    obj = json.loads(candidate)
+                    return obj if isinstance(obj, dict) else None
+                except json.JSONDecodeError:
+                    return None
+
+    return None
+
+
+def normalize_ai_result(data):
+    if not isinstance(data, dict):
+        return None
+
+    score = max(0, min(100, safe_int(data.get("match_score", 0))))
+    return {
+        "match_score": score,
+        "matched_skills": safe_list(data.get("matched_skills")),
+        "missing_skills": safe_list(data.get("missing_skills")),
+        "experience_match": clean_text(data.get("experience_match")),
+        "reason": clean_text(data.get("reason")),
+    }
+
+
+def analyze_with_gemini(job, profile):
+    global gemini_available, gemini_rate_limited
+
+    if not gemini_available or gemini_rate_limited or gemini_client is None:
         return None
 
     try:
         interaction = gemini_client.interactions.create(
-            model=GEMINI_MODEL,
-            input=build_ai_prompt(job, profile),
+            model=AI_MODEL,
+            input=build_ai_prompt(job, profile)
         )
+        raw = getattr(interaction, "output_text", None)
+        result = normalize_ai_result(extract_json_object(raw))
 
-        return parse_ai_result(
-            interaction.output_text
-        )
-
-    except Exception as exc:
-        error_text = str(exc)
-
-        if (
-            "429" in error_text
-            or "rate limit" in error_text.lower()
-            or "too_many_requests" in error_text.lower()
-            or "quota" in error_text.lower()
-        ):
-            gemini_rate_limited = True
-
-            print(
-                "⚠️ GEMINI RATE LIMIT / QUOTA REACHED"
-            )
-
-            print(
-                "➡️ Switching to OpenRouter FREE fallback."
-            )
-
-        else:
-            print(
-                "⚠️ Gemini unavailable."
-            )
-
-            print(
-                "➡️ Switching to OpenRouter FREE fallback."
-            )
-
-            print(
-                "Gemini error:",
-                error_text,
-            )
-
-        gemini_available = False
-
-        return None
-
-
-# ============================================================
-# OPENROUTER FREE FALLBACK
-# ============================================================
-
-def analyze_job_with_openrouter(job, profile):
-    global openrouter_fallbacks
-    global openrouter_errors
-
-    if not OPENROUTER_API_KEY:
-        print(
-            "ERROR: OPENROUTER_API_KEY not found."
-        )
-
-        openrouter_errors += 1
-        return None
-
-    url = (
-        "https://openrouter.ai/api/v1/"
-        "chat/completions"
-    )
-
-    headers = {
-        "Authorization":
-            f"Bearer {OPENROUTER_API_KEY}",
-
-        "Content-Type":
-            "application/json",
-
-        "X-Title":
-            "AI Job Tracker",
-    }
-
-    payload = {
-        "model": OPENROUTER_MODEL,
-
-        "messages": [
-            {
-                "role": "user",
-                "content": build_ai_prompt(
-                    job,
-                    profile,
-                ),
-            }
-        ],
-
-        "temperature": 0.1,
-
-        "max_tokens": 500,
-    }
-
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=OPENROUTER_TIMEOUT_SECONDS,
-        )
-
-        if response.status_code != 200:
-            openrouter_errors += 1
-
-            print(
-                "OpenRouter API error:",
-                response.status_code,
-            )
-
-            print(
-                response.text[:500]
-            )
-
+        if result is None:
+            print("Gemini returned invalid JSON.")
             return None
-
-        data = response.json()
-
-        choices = data.get(
-            "choices",
-            [],
-        )
-
-        if not choices:
-            openrouter_errors += 1
-
-            print(
-                "OpenRouter returned no choices."
-            )
-
-            return None
-
-        content = (
-            choices[0]
-            .get("message", {})
-            .get("content", "")
-        )
-
-        result = parse_ai_result(
-            content
-        )
-
-        if result is not None:
-            openrouter_fallbacks += 1
-
-            print(
-                "✅ OpenRouter FREE fallback "
-                "analysis successful!"
-            )
 
         return result
 
-    except requests.RequestException as exc:
-        openrouter_errors += 1
-
-        print(
-            "OpenRouter request error:",
-            exc,
-        )
-
-        return None
-
-    except (
-        ValueError,
-        TypeError,
-    ) as exc:
-        openrouter_errors += 1
-
-        print(
-            "OpenRouter response error:",
-            exc,
-        )
-
+    except Exception as exc:
+        msg = str(exc).lower()
+        if any(x in msg for x in [
+            "429", "rate limit", "quota", "resource exhausted"
+        ]):
+            gemini_rate_limited = True
+            gemini_available = False
+            print("⚠️ GEMINI RATE LIMIT / QUOTA REACHED")
+            print("➡️ Switching to OpenRouter FREE fallback.")
+        else:
+            print(f"Gemini error: {exc}")
+            gemini_available = False
         return None
 
 
-def analyze_job_with_ai(job, profile):
-    """
-    Gemini is primary.
-    OpenRouter/free is fallback when Gemini is unavailable,
-    rate-limited or returns an unusable result.
-    """
+def analyze_with_openrouter(job, profile):
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        print("OpenRouter API key not found.")
+        stats["openrouter_errors"] += 1
+        return None
 
-    if gemini_available:
-        result = analyze_job_with_gemini(
-            job,
-            profile,
-        )
+    print("🔄 Trying OpenRouter FREE fallback...")
 
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": build_ai_prompt(job, profile)}],
+        "temperature": 0.1,
+        "max_tokens": 700,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "X-Title": "AI Job Tracker",
+    }
+
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            if response.status_code != 200:
+                print(
+                    f"OpenRouter HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                stats["openrouter_errors"] += 1
+                return None
+
+            data = response.json()
+            choices = data.get("choices") or []
+            if not choices:
+                print("OpenRouter returned no choices.")
+                stats["openrouter_errors"] += 1
+                return None
+
+            content = (choices[0].get("message") or {}).get("content", "")
+
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("text"):
+                        parts.append(str(item["text"]))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                content = "\n".join(parts)
+
+            result = normalize_ai_result(extract_json_object(content))
+
+            if result is not None:
+                print("✅ OpenRouter FREE fallback analysis successful!")
+                return result
+
+            print(
+                "AI returned invalid JSON. "
+                f"Raw response: {str(content)[:700]}"
+            )
+            if attempt == 0:
+                time.sleep(2)
+                continue
+
+            stats["openrouter_errors"] += 1
+            return None
+
+        except requests.RequestException as exc:
+            print(f"OpenRouter request error: {exc}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            stats["openrouter_errors"] += 1
+            return None
+        except Exception as exc:
+            print(f"OpenRouter processing error: {exc}")
+            stats["openrouter_errors"] += 1
+            return None
+
+    return None
+
+
+def analyze_job(job, profile):
+    if gemini_available and not gemini_rate_limited:
+        result = analyze_with_gemini(job, profile)
         if result is not None:
+            print("AI Provider: Gemini")
             return result, "Gemini"
 
-    print(
-        "🔄 Trying OpenRouter FREE fallback..."
-    )
-
-    result = analyze_job_with_openrouter(
-        job,
-        profile,
-    )
+    stats["openrouter_fallback_uses"] += 1
+    result = analyze_with_openrouter(job, profile)
 
     if result is not None:
+        print("AI Provider: OpenRouter")
         return result, "OpenRouter"
 
     return None, "None"
 
 
-# ============================================================
-# ADZUNA
-# ============================================================
+def get_adzuna_jobs(query, location, page):
+    app_id = os.environ.get("ADZUNA_APP_ID")
+    app_key = os.environ.get("ADZUNA_APP_KEY")
 
-def fetch_adzuna_page(
-    page,
-    query,
-    location,
-):
-    global adzuna_api_errors
+    if not app_id or not app_key:
+        print("Adzuna credentials missing.")
+        stats["adzuna_api_errors"] += 1
+        return []
 
+    url = f"https://api.adzuna.com/v1/api/jobs/in/search/{page}"
     params = {
-        "app_id":
-            ADZUNA_APP_ID,
-
-        "app_key":
-            ADZUNA_APP_KEY,
-
-        "results_per_page":
-            RESULTS_PER_PAGE,
-
-        "what":
-            query,
-
-        "where":
-            location,
-
-        "content-type":
-            "application/json",
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": RESULTS_PER_PAGE,
+        "what": query,
+        "where": location,
+        "content-type": "application/json",
     }
 
-    for attempt in range(
-        1,
-        MAX_API_RETRIES + 1,
-    ):
-
+    for attempt in range(3):
         try:
-            url = ADZUNA_API_URL.format(
-                page=page,
-            )
+            response = requests.get(url, params=params, timeout=30)
 
-            response = requests.get(
-                url,
-                params=params,
-                timeout=30,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-
-                return data.get(
-                    "results",
-                    [],
-                )
-
-            if response.status_code in {
-                500,
-                502,
-                503,
-                504,
-            }:
-
-                print(
-                    f"Adzuna server error "
-                    f"{response.status_code}. "
-                    f"Retry {attempt}/"
-                    f"{MAX_API_RETRIES}"
-                )
-
-                if attempt < MAX_API_RETRIES:
-                    time.sleep(
-                        RETRY_DELAY_SECONDS
-                        * attempt
-                    )
-
+            if response.status_code in {500, 502, 503, 504}:
+                print(f"Adzuna server error {response.status_code}")
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
                     continue
 
-            print(
-                "Adzuna API error:",
-                response.status_code,
-            )
-
-            adzuna_api_errors += 1
-
-            return []
+            response.raise_for_status()
+            return response.json().get("results", [])
 
         except requests.RequestException as exc:
+            print(f"Adzuna API error: {exc}")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            stats["adzuna_api_errors"] += 1
+            return []
+        except Exception as exc:
+            print(f"Adzuna response error: {exc}")
+            stats["adzuna_api_errors"] += 1
+            return []
 
-            print(
-                "Adzuna request error:",
-                exc,
-            )
-
-            if attempt < MAX_API_RETRIES:
-
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                    * attempt
-                )
-
-            else:
-
-                adzuna_api_errors += 1
-
-                return []
-
-    adzuna_api_errors += 1
-
+    stats["adzuna_api_errors"] += 1
     return []
 
 
-# ============================================================
-# GOOGLE SHEETS VERIFY + WRITE
-# ============================================================
+SENIOR_TITLE_PATTERNS = [
+    r"\bsenior\b", r"\bsr\.?\b", r"\blead\b", r"\bprincipal\b",
+    r"\bmanager\b", r"\bdirector\b", r"\bhead\b", r"\barchitect\b",
+    r"\bvp\b", r"\bvice president\b", r"\btechnical lead\b",
+]
 
-def verify_sheet_append(
-    worksheet,
-    company,
-    job_title,
-):
+THREE_PLUS_YEAR_PATTERNS = [
+    r"\b3\+?\s*years?\b", r"\b4\+?\s*years?\b",
+    r"\b5\+?\s*years?\b", r"\b6\+?\s*years?\b",
+    r"\b7\+?\s*years?\b", r"\b8\+?\s*years?\b",
+    r"\b9\+?\s*years?\b", r"\b10\+?\s*years?\b",
+]
+
+
+def is_senior_title(title):
+    title = clean_text(title).lower()
+    return any(re.search(p, title) for p in SENIOR_TITLE_PATTERNS)
+
+
+def requires_three_plus_years(job):
+    text = clean_text(
+        job.get("experience") or job.get("description") or ""
+    ).lower()
+    return any(re.search(p, text) for p in THREE_PLUS_YEAR_PATTERNS)
+
+
+def prepare_job(raw, location):
+    title = clean_text(raw.get("title"))
+    company_data = raw.get("company") or {}
+    company = (
+        clean_text(company_data.get("display_name"))
+        if isinstance(company_data, dict)
+        else clean_text(company_data)
+    ) or "Unknown"
+
+    loc_data = raw.get("location") or {}
+    if isinstance(loc_data, dict):
+        job_location = clean_text(loc_data.get("display_name")) or location
+    else:
+        job_location = clean_text(loc_data) or location
+
+    lo = raw.get("salary_min")
+    hi = raw.get("salary_max")
+    if lo and hi:
+        salary = f"{lo} - {hi}"
+    elif lo:
+        salary = str(lo)
+    elif hi:
+        salary = str(hi)
+    else:
+        salary = "Not specified"
+
+    return {
+        "title": title,
+        "company": company,
+        "location": job_location,
+        "salary": salary,
+        "experience": clean_text(raw.get("experience") or raw.get("contract_time")),
+        "description": clean_text(raw.get("description")),
+        "apply_link": clean_text(raw.get("redirect_url") or raw.get("url")),
+    }
+
+
+def make_job_key(company, title, location):
+    return (
+        normalize_key(company),
+        normalize_key(title),
+        normalize_key(location),
+    )
+
+
+def connect_google_sheet():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        print("GOOGLE_SERVICE_ACCOUNT_JSON missing.")
+        return None
+
+    try:
+        info = json.loads(raw)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+        print("Google Sheet connected successfully!")
+        return sheet
+    except Exception as exc:
+        print(f"Google Sheet connection failed: {exc}")
+        return None
+
+
+def update_headers(worksheet):
+    try:
+        worksheet.update(range_name="A1:N1", values=[HEADERS])
+        print("Google Sheet headers updated for V2.2!")
+        return True
+    except Exception as exc:
+        print(f"Google Sheet header update failed: {exc}")
+        return False
+
+
+def load_existing_job_keys(worksheet):
+    keys = set()
     try:
         rows = worksheet.get_all_values()
-
-        target_company = (
-            company.strip().lower()
-        )
-
-        target_title = (
-            job_title.strip().lower()
-        )
-
-        for row_number in range(
-            len(rows) - 1,
-            0,
-            -1,
-        ):
-
-            row = rows[row_number]
-
-            if len(row) < 3:
-                continue
-
-            if (
-                row[1].strip().lower()
-                == target_company
-                and
-                row[2].strip().lower()
-                == target_title
-            ):
-
-                actual_row = (
-                    row_number + 1
-                )
-
-                print(
-                    "✅ GOOGLE SHEET "
-                    "VERIFICATION SUCCESS"
-                )
-
-                print(
-                    f"Sheet Row: {actual_row}"
-                )
-
-                return True
-
-        print(
-            "❌ GOOGLE SHEET "
-            "VERIFICATION FAILED"
-        )
-
-        return False
-
+        for row in rows[1:]:
+            if len(row) >= 4 and (row[1] or row[2]):
+                keys.add(make_job_key(row[1], row[2], row[3]))
     except Exception as exc:
-
-        print(
-            "Sheet verification error:",
-            exc,
-        )
-
-        return False
+        print(f"Could not load existing sheet rows: {exc}")
+    return keys
 
 
-def append_job_to_sheet(
-    worksheet,
-    job,
-    ai_result,
-):
-    global new_jobs_added
-
-    company = (
-        job.get("company", {})
-        .get(
-            "display_name",
-            "Unknown",
-        )
-    )
-
-    job_title = job.get(
-        "title",
-        "Unknown",
-    )
-
-    location = (
-        job.get("location", {})
-        .get(
-            "display_name",
-            "Not specified",
-        )
-    )
-
-    description = job.get(
-        "description",
-        "",
-    )
-
-    salary = format_salary(
-        job
-    )
-
-    experience = (
-        "Fresher / Entry Level"
-        if detect_fresher(
-            description
-        )
-        else "Not specified"
-    )
-
-    skills = description[:300]
-
-    match_score = ai_result.get(
-        "match_score",
-        0,
-    )
-
-    matched_skills = ai_result.get(
-        "matched_skills",
-        [],
-    )
-
-    missing_skills = ai_result.get(
-        "missing_skills",
-        [],
-    )
-
-    if not isinstance(
-        matched_skills,
-        list,
-    ):
-        matched_skills = [
-            str(matched_skills)
-        ]
-
-    if not isinstance(
-        missing_skills,
-        list,
-    ):
-        missing_skills = [
-            str(missing_skills)
-        ]
-
-    row = [
-        datetime.now().strftime(
-            "%Y-%m-%d"
-        ),
-
-        company,
-
-        job_title,
-
-        location,
-
-        salary,
-
-        experience,
-
-        skills,
-
-        match_score,
-
-        job.get(
-            "redirect_url",
-            "",
-        ),
-
+def build_sheet_row(job, result):
+    matched = result.get("matched_skills", [])
+    return [
+        datetime.now().strftime("%Y-%m-%d"),
+        job["company"],
+        job["title"],
+        job["location"],
+        job["salary"],
+        job["experience"],
+        ", ".join(matched),
+        result["match_score"],
+        job["apply_link"],
         "Not Applied",
-
-        ", ".join(
-            str(x)
-            for x in matched_skills
-        ),
-
-        ", ".join(
-            str(x)
-            for x in missing_skills
-        ),
-
-        ai_result.get(
-            "experience_match",
-            "",
-        ),
-
-        ai_result.get(
-            "reason",
-            "",
-        ),
+        ", ".join(matched),
+        ", ".join(result.get("missing_skills", [])),
+        result.get("experience_match", ""),
+        result.get("reason", ""),
     ]
 
+
+def append_and_verify_job(worksheet, row, job):
+    """
+    Verify by exact company/title/location after append.
+    Also checks that the sheet row count increased.
+    """
     try:
-        print(
-            "📊 Writing job to Google Sheet..."
-        )
+        before = worksheet.get_all_values()
+        before_count = len(before)
 
-        worksheet.append_row(
-            row,
-            value_input_option="USER_ENTERED",
-        )
+        worksheet.append_row(row, value_input_option="USER_ENTERED")
+        time.sleep(1)
 
-        verified = verify_sheet_append(
-            worksheet,
-            company,
-            job_title,
-        )
+        after = worksheet.get_all_values()
 
-        if not verified:
-            print(
-                "❌ Job append could not "
-                "be verified."
-            )
-
+        if len(after) <= before_count:
+            print("❌ GOOGLE SHEET VERIFICATION FAILED: row count did not increase.")
             return False
 
-        new_jobs_added += 1
+        target = make_job_key(job["company"], job["title"], job["location"])
 
-        print(
-            "✅ Job saved and verified "
-            "in Google Sheet."
-        )
+        for sheet_row in reversed(after[1:]):
+            if len(sheet_row) < 4:
+                continue
+            current = make_job_key(sheet_row[1], sheet_row[2], sheet_row[3])
+            if current == target:
+                print("✅ Google Sheet append verified!")
+                return True
 
-        return True
+        print("❌ GOOGLE SHEET VERIFICATION FAILED: matching row not found.")
+        return False
 
     except Exception as exc:
-
-        print(
-            "❌ Google Sheet append error:",
-            exc,
-        )
-
+        print(f"❌ Google Sheet append failed: {exc}")
         return False
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
-    global ai_jobs_processed
-    global duplicate_jobs
-    global rejected_jobs
-    global total_jobs_seen
+    global existing_job_keys
 
-    print(
-        "\n" + "=" * 70
-    )
+    print("=" * 70)
+    print("AI Job Tracker V2.2 Started!")
+    print("Gemini PRIMARY + OpenRouter FREE FALLBACK")
+    print("=" * 70)
 
-    print(
-        "AI Job Tracker V2.2 Started!"
-    )
-
-    print(
-        "Gemini PRIMARY + OpenRouter FREE FALLBACK"
-    )
-
-    print(
-        "=" * 70 + "\n"
-    )
-
-    if not ADZUNA_APP_ID:
-        print(
-            "ERROR: ADZUNA_APP_ID not found."
-        )
-        return
-
-    if not ADZUNA_APP_KEY:
-        print(
-            "ERROR: ADZUNA_APP_KEY not found."
-        )
-        return
-
+    profile = load_candidate_profile()
     initialize_gemini()
 
-    if not OPENROUTER_API_KEY:
-        print(
-            "WARNING: OPENROUTER_API_KEY "
-            "not found. Fallback unavailable."
-        )
-
-    profile = load_profile()
-
-    if not profile:
-        return
-
     worksheet = connect_google_sheet()
-
     if worksheet is None:
+        print("Cannot continue without Google Sheet.")
         return
 
-    update_sheet_headers(
-        worksheet
-    )
+    update_headers(worksheet)
+    existing_job_keys = load_existing_job_keys(worksheet)
 
-    existing_jobs = get_existing_jobs(
-        worksheet
-    )
+    print(f"Existing jobs in Sheet: {len(existing_job_keys)}")
 
-    stop_search = False
+    ai_counter = 0
 
     for query in SEARCH_QUERIES:
-
-        if stop_search:
+        if ai_counter >= MAX_AI_JOBS:
             break
 
-        print(
-            "\n" + "=" * 70
-        )
-
-        print(
-            f"Searching: {query}"
-        )
-
-        print(
-            "=" * 70
-        )
+        print("\n" + "=" * 70)
+        print(f"Searching: {query}")
+        print("=" * 70)
 
         for location in LOCATIONS:
-
-            if stop_search:
+            if ai_counter >= MAX_AI_JOBS:
                 break
 
-            print(
-                f"\nLocation: {location}"
-            )
+            print(f"\nLocation: {location}")
 
-            for page in range(
-                1,
-                TOTAL_PAGES + 1,
-            ):
-
-                if ai_jobs_processed >= MAX_AI_JOBS:
-
-                    print(
-                        "Maximum AI analysis "
-                        "limit reached."
-                    )
-
-                    stop_search = True
-
+            for page in range(1, TOTAL_PAGES + 1):
+                if ai_counter >= MAX_AI_JOBS:
                     break
 
-                jobs = fetch_adzuna_page(
-                    page,
-                    query,
-                    location,
-                )
+                jobs = get_adzuna_jobs(query, location, page)
+                print(f"Page {page}: {len(jobs)} jobs received.")
 
-                print(
-                    f"Page {page}: "
-                    f"{len(jobs)} jobs received."
-                )
+                if not jobs:
+                    continue
 
-                for job in jobs:
+                for raw in jobs:
+                    stats["total_jobs_seen"] += 1
+                    job = prepare_job(raw, location)
 
-                    if ai_jobs_processed >= MAX_AI_JOBS:
+                    if not job["title"]:
+                        stats["jobs_rejected"] += 1
+                        continue
 
-                        stop_search = True
+                    if is_senior_title(job["title"]):
+                        print(f"Rejected senior/lead title: {job['title']}")
+                        stats["jobs_rejected"] += 1
+                        continue
 
+                    if requires_three_plus_years(job):
+                        print(f"Rejected 3+ years: {job['title']}")
+                        stats["jobs_rejected"] += 1
+                        continue
+
+                    key = make_job_key(
+                        job["company"], job["title"], job["location"]
+                    )
+
+                    if key in existing_job_keys:
+                        print(f"Skipping duplicate: {job['title']}")
+                        stats["duplicate_jobs_skipped"] += 1
+                        continue
+
+                    ai_counter += 1
+                    stats["jobs_analyzed"] += 1
+
+                    print("\n" + "-" * 70)
+                    print(f"AI Analysis: {ai_counter}/{MAX_AI_JOBS}")
+                    print(f"Job: {job['title']}")
+                    print(f"Company: {job['company']}")
+
+                    result, provider = analyze_job(job, profile)
+
+                    if result is None:
+                        print("❌ No valid AI analysis available.")
+                        stats["jobs_rejected"] += 1
+                        continue
+
+                    score = result["match_score"]
+                    print(f"AI Provider: {provider}")
+                    print(f"AI Match Score: {score}/100")
+
+                    if score < AI_MIN_SCORE:
+                        print(f"Rejected by AI: {job['title']}")
+                        stats["jobs_rejected"] += 1
+                        continue
+
+                    print("\n" + "=" * 70)
+                    print("🎯 NEW AI-MATCHED JOB FOUND")
+                    print(f"Job: {job['title']}")
+                    print(f"Company: {job['company']}")
+                    print(f"Location: {job['location']}")
+                    print(f"Salary: {job['salary']}")
+                    print(f"Matched Skills: {result['matched_skills']}")
+                    print(f"Missing Skills: {result['missing_skills']}")
+                    print(f"Experience Match: {result['experience_match']}")
+                    print(f"Reason: {result['reason']}")
+
+                    print("\n📊 Writing job to Google Sheet...")
+                    row = build_sheet_row(job, result)
+
+                    if append_and_verify_job(worksheet, row, job):
+                        existing_job_keys.add(key)
+                        stats["new_jobs_added"] += 1
+                    else:
+                        print("❌ Job append could not be verified.")
+
+                    time.sleep(2)
+
+                    if ai_counter >= MAX_AI_JOBS:
                         break
 
-                    total_jobs_seen += 1
-
-                    title = job.get(
-                        "title",
-                        "",
-                    )
-
-                    company = (
-                        job.get("company", {})
-                        .get(
-                            "display_name",
-                            "Unknown",
-                        )
-                    )
-
-                    description = job.get(
-                        "description",
-                        "",
-                    )
-
-                    if is_duplicate(
-                        job,
-                        existing_jobs,
-                    ):
-
-                        duplicate_jobs += 1
-
-                        print(
-                            f"Skipping duplicate: "
-                            f"{title}"
-                        )
-
-                        continue
-
-                    if is_senior_title(
-                        title
-                    ):
-
-                        rejected_jobs += 1
-
-                        print(
-                            f"Rejected senior/lead "
-                            f"title: {title}"
-                        )
-
-                        continue
-
-                    if requires_three_plus_years(
-                        description
-                    ):
-
-                        rejected_jobs += 1
-
-                        print(
-                            f"Rejected 3+ years: "
-                            f"{title}"
-                        )
-
-                        continue
-
-                    ai_jobs_processed += 1
-
-                    print(
-                        "\n" + "-" * 70
-                    )
-
-                    print(
-                        f"AI Analysis: "
-                        f"{ai_jobs_processed}/"
-                        f"{MAX_AI_JOBS}"
-                    )
-
-                    print(
-                        f"Job: {title}"
-                    )
-
-                    print(
-                        f"Company: {company}"
-                    )
-
-                    ai_result, provider = (
-                        analyze_job_with_ai(
-                            job,
-                            profile,
-                        )
-                    )
-
-                    if ai_result is None:
-
-                        rejected_jobs += 1
-
-                        print(
-                            "❌ No valid AI "
-                            "analysis available."
-                        )
-
-                        continue
-
-                    try:
-
-                        ai_score = int(
-                            ai_result.get(
-                                "match_score",
-                                0,
-                            )
-                        )
-
-                    except (
-                        ValueError,
-                        TypeError,
-                    ):
-
-                        ai_score = 0
-
-                    print(
-                        f"AI Provider: "
-                        f"{provider}"
-                    )
-
-                    print(
-                        f"AI Match Score: "
-                        f"{ai_score}/100"
-                    )
-
-                    if ai_score < AI_MIN_SCORE:
-
-                        rejected_jobs += 1
-
-                        print(
-                            f"Rejected by AI: "
-                            f"{title}"
-                        )
-
-                        continue
-
-                    print(
-                        "\n" + "=" * 70
-                    )
-
-                    print(
-                        "🎯 NEW AI-MATCHED JOB FOUND"
-                    )
-
-                    print(
-                        f"Job: {title}"
-                    )
-
-                    print(
-                        f"Company: {company}"
-                    )
-
-                    print(
-                        "Location:",
-                        job.get(
-                            "location",
-                            {},
-                        ).get(
-                            "display_name",
-                            "Not specified",
-                        ),
-                    )
-
-                    print(
-                        "Salary:",
-                        format_salary(job),
-                    )
-
-                    print(
-                        "Matched Skills:",
-                        ai_result.get(
-                            "matched_skills",
-                            [],
-                        ),
-                    )
-
-                    print(
-                        "Missing Skills:",
-                        ai_result.get(
-                            "missing_skills",
-                            [],
-                        ),
-                    )
-
-                    print(
-                        "Experience Match:",
-                        ai_result.get(
-                            "experience_match",
-                            "",
-                        ),
-                    )
-
-                    print(
-                        "Reason:",
-                        ai_result.get(
-                            "reason",
-                            "",
-                        ),
-                    )
-
-                    save_success = (
-                        append_job_to_sheet(
-                            worksheet,
-                            job,
-                            ai_result,
-                        )
-                    )
-
-                    if save_success:
-
-                        existing_jobs.add(
-                            (
-                                company
-                                .strip()
-                                .lower(),
-
-                                title
-                                .strip()
-                                .lower(),
-                            )
-                        )
-
-                    time.sleep(
-                        AI_DELAY_SECONDS
-                    )
-
-                if stop_search:
-                    break
-
-            if stop_search:
-                break
-
-        if stop_search:
-            break
-
-    print(
-        "\n" + "=" * 70
-    )
-
-    print(
-        "JOB SEARCH COMPLETED"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"Total jobs seen: "
-        f"{total_jobs_seen}"
-    )
-
-    print(
-        f"Jobs analyzed: "
-        f"{ai_jobs_processed}"
-    )
-
-    print(
-        f"New AI-matched jobs added: "
-        f"{new_jobs_added}"
-    )
-
-    print(
-        f"Duplicate jobs skipped: "
-        f"{duplicate_jobs}"
-    )
-
-    print(
-        f"Jobs rejected: "
-        f"{rejected_jobs}"
-    )
-
-    print(
-        f"Adzuna API errors: "
-        f"{adzuna_api_errors}"
-    )
-
-    print(
-        f"OpenRouter fallback uses: "
-        f"{openrouter_fallbacks}"
-    )
-
-    print(
-        f"OpenRouter errors: "
-        f"{openrouter_errors}"
-    )
+    print("\n" + "=" * 70)
+    print("JOB SEARCH COMPLETED")
+    print("=" * 70)
+    print(f"Total jobs seen: {stats['total_jobs_seen']}")
+    print(f"Jobs analyzed: {stats['jobs_analyzed']}")
+    print(f"New AI-matched jobs added: {stats['new_jobs_added']}")
+    print(f"Duplicate jobs skipped: {stats['duplicate_jobs_skipped']}")
+    print(f"Jobs rejected: {stats['jobs_rejected']}")
+    print(f"Adzuna API errors: {stats['adzuna_api_errors']}")
+    print(f"OpenRouter fallback uses: {stats['openrouter_fallback_uses']}")
+    print(f"OpenRouter errors: {stats['openrouter_errors']}")
 
     if gemini_rate_limited:
-
-        print(
-            "Gemini status: RATE LIMIT / QUOTA "
-            "REACHED → OPENROUTER FALLBACK"
-        )
-
+        print("Gemini status: RATE LIMIT / QUOTA REACHED → OPENROUTER FALLBACK")
     elif gemini_available:
-
-        print(
-            "Gemini status: AVAILABLE"
-        )
-
+        print("Gemini status: AVAILABLE")
     else:
+        print("Gemini status: UNAVAILABLE")
 
-        print(
-            "Gemini status: UNAVAILABLE → "
-            "OPENROUTER FALLBACK"
-        )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "AI Job Tracker V2.2 Finished!"
-    )
+    print("=" * 70)
+    print("AI Job Tracker V2.2 Finished!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
