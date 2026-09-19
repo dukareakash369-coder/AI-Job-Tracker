@@ -1,4 +1,4 @@
-# AI Job Tracker V2.3.4 - Gemini + Groq Stable
+# AI Job Tracker V2.4 - Gemini + Groq Stable
 # Gemini primary + Groq fallback
 #
 # V2.2.1 fixes:
@@ -11,10 +11,12 @@
 # 7) Existing filtering / duplicate logic retained
 # 8) OpenRouter removed; Groq is the only fallback provider
 # 9) Company-name normalization improves duplicate detection (e.g. Cummins vs Cummins Inc.)
-# 10) Sheet header/version log updated to V2.3.4
+# 10) Sheet header/version log updated to V2.4
 # 11) 3+ years filter checks title + experience + description
 # 12) AI experience mismatch filter rejects unsuitable AI assessments
 # 13) Matched skills are restricted to skills explicitly supported by the job
+# 14) V2.4 deterministic skill grounding removes AI-overclaimed matched skills
+# 15) Missing skills are kept only when explicitly supported by the job text
 
 import os
 import re
@@ -276,13 +278,20 @@ SCORING RUBRIC
 
 2. SKILLS MATCH: 0-40 points
 - Compare the job requirements with the candidate's actual skills.
-- Give higher points when important required skills match.
-- Embedded C, C, C++, Python, ESP32, Arduino, Raspberry Pi,
-  Embedded Linux, GPIO, PWM, UART, SPI, I2C, sensors,
-  hardware debugging, IoT, ROS and robotics skills are especially relevant.
-- Do NOT require every job skill to be present.
-- Missing optional or advanced skills should not heavily reduce the score.
-- Do NOT invent skills that are not present in the candidate profile.
+- IMPORTANT: A candidate skill counts as matched ONLY when the same skill,
+  technology, protocol, tool, language, framework, platform, or a clearly
+  equivalent term is explicitly mentioned or clearly required/used in the
+  job title or job description.
+- Never treat a candidate skill as matched merely because it is generally
+  relevant to embedded engineering.
+- Do NOT infer ESP32, Arduino, Raspberry Pi, GPIO, PWM, UART, SPI, I2C, ROS,
+  Motor Control, Embedded C, C++, etc. unless the job explicitly mentions
+  them or an unambiguous equivalent.
+- Distinguish candidate skills from job requirements. The candidate profile
+  is NOT evidence that the job uses that technology.
+- Missing required or must-have skills should reduce the skills-match score
+  more than optional/good-to-have gaps.
+- Do NOT require every optional job skill to be present.
 
 3. EXPERIENCE COMPATIBILITY: 0-15 points
 - Fresher / Entry-level / Junior / 0-2 years:
@@ -371,17 +380,19 @@ Required JSON schema:
 
 Output rules:
 - match_score must be an integer from 0 to 100.
-- matched_skills must contain ONLY candidate skills that are:
-  (1) actually present in the candidate profile, AND
-  (2) explicitly mentioned, clearly required, or clearly used in the job title
-      or job description.
+- matched_skills must contain ONLY candidate skills that are explicitly
+  grounded in the job text. Every item must satisfy BOTH conditions:
+  (1) it exists in the candidate profile, and
+  (2) the same skill or an unambiguous equivalent is present in the job
+      title or description.
 - Do NOT list a candidate skill merely because it is generally relevant to
   embedded jobs.
-- Do NOT infer that a skill is a match when the job does not mention or
-  clearly require/use it.
-- missing_skills should contain only important skills or technologies that
-  are explicitly required or clearly expected by the job and are not present
-  in the candidate profile.
+- Do NOT infer a technology from a broad category. For example, Linux does
+  not imply Embedded Linux, and embedded systems does not imply ESP32/Arduino.
+- missing_skills should contain important job skills that are explicitly
+  required or clearly expected by the job and are not present in the
+  candidate profile. Prioritize must-have requirements over good-to-have
+  requirements.
 - experience_match should briefly describe whether the job experience
   requirement is suitable for the candidate.
 - reason should briefly explain why the score was assigned.
@@ -459,6 +470,126 @@ def extract_json_object(text):
                     return None
 
     return None
+
+
+def _flatten_candidate_skills(profile):
+    """Return a clean list of skills from either dict- or list-based profiles."""
+
+    skills = profile.get("skills", []) if isinstance(profile, dict) else []
+
+    if isinstance(skills, dict):
+        values = []
+        for group in skills.values():
+            if isinstance(group, list):
+                values.extend(group)
+            elif group:
+                values.append(group)
+        return [clean_text(x) for x in values if clean_text(x)]
+
+    return safe_list(skills)
+
+
+def _skill_key(skill):
+    """Normalize a skill without collapsing distinct skills such as C and C++."""
+
+    value = clean_text(skill).lower()
+    value = value.replace("c++", "cpp")
+    value = value.replace("c#", "csharp")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _skill_is_in_job_text(skill, job_text):
+    """Check whether a skill is explicitly grounded in the job text."""
+
+    skill = clean_text(skill)
+    job_text = clean_text(job_text)
+
+    if not skill or not job_text:
+        return False
+
+    # First use a word-boundary regex. This safely handles C, C++, C#,
+    # RS232/485 and other punctuation-heavy skill names.
+    escaped = re.escape(skill.lower())
+    if re.search(
+        r"(?<![a-z0-9])" + escaped + r"(?![a-z0-9])",
+        job_text.lower(),
+    ):
+        return True
+
+    # Also support normalized multi-word phrases.
+    normalized_skill = _skill_key(skill)
+    normalized_job = _skill_key(job_text)
+
+    return bool(
+        normalized_skill
+        and normalized_skill in normalized_job
+    )
+
+
+def ground_ai_skill_lists(result, job, profile):
+    """
+    Deterministically ground AI skill lists after the model responds.
+
+    matched_skills: must exist in candidate profile AND job text.
+    missing_skills: must be supported by job text AND not exist in profile.
+    """
+
+    candidate_skills = _flatten_candidate_skills(profile)
+    candidate_by_normalized = {
+        _skill_key(skill): skill
+        for skill in candidate_skills
+        if _skill_key(skill)
+    }
+
+    job_text = " ".join(
+        part
+        for part in [
+            clean_text(job.get("title")),
+            clean_text(job.get("description")),
+            clean_text(job.get("experience")),
+        ]
+        if clean_text(part)
+    )
+
+    grounded_matched = []
+    removed_matched = []
+
+    for ai_skill in safe_list(result.get("matched_skills")):
+        normalized_ai = _skill_key(ai_skill)
+
+        # Accept only a skill that maps back to a real candidate skill.
+        candidate_skill = candidate_by_normalized.get(normalized_ai)
+
+        if candidate_skill and _skill_is_in_job_text(candidate_skill, job_text):
+            if candidate_skill not in grounded_matched:
+                grounded_matched.append(candidate_skill)
+        else:
+            removed_matched.append(ai_skill)
+
+    grounded_missing = []
+
+    for ai_skill in safe_list(result.get("missing_skills")):
+        if not _skill_is_in_job_text(ai_skill, job_text):
+            continue
+
+        normalized_ai = _skill_key(ai_skill)
+        if normalized_ai in candidate_by_normalized:
+            continue
+
+        if ai_skill not in grounded_missing:
+            grounded_missing.append(ai_skill)
+
+    if removed_matched:
+        print(
+            "⚠️ V2.4 removed ungrounded AI matched skills: "
+            + ", ".join(removed_matched)
+        )
+
+    result["matched_skills"] = grounded_matched
+    result["missing_skills"] = grounded_missing
+
+    return result
 
 
 def normalize_ai_result(data):
@@ -1087,7 +1218,7 @@ def update_headers(worksheet):
         )
 
         print(
-            "Google Sheet headers verified for V2.3.4!"
+            "Google Sheet headers verified for V2.4!"
         )
 
         return True
@@ -1359,7 +1490,7 @@ def main():
     global stop_ai_processing
 
     print("=" * 70)
-    print("AI Job Tracker V2.3.4 Started!")
+    print("AI Job Tracker V2.4 Started!")
     print(
         "Gemini PRIMARY + Groq FALLBACK"
     )
@@ -1574,6 +1705,15 @@ def main():
                         continue
 
                     score = result["match_score"]
+
+                    # ----------------------------------------
+                    # V2.4 JOB REQUIREMENT GROUNDING
+                    # ----------------------------------------
+                    result = ground_ai_skill_lists(
+                        result,
+                        job,
+                        profile,
+                    )
 
                     # ----------------------------------------
                     # EXPERIENCE COMPATIBILITY FILTER
@@ -1802,7 +1942,7 @@ def main():
 
     print("=" * 70)
     print(
-        "AI Job Tracker V2.3.4 Finished!"
+        "AI Job Tracker V2.4 Finished!"
     )
     print("=" * 70)
 
