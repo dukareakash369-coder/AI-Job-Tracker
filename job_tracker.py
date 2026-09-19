@@ -863,11 +863,31 @@ def is_senior_title(title):
 
 
 def requires_three_plus_years(job):
-    text = clean_text(
-        job.get("experience")
-        or job.get("description")
+    title = clean_text(
+        job.get("title")
         or ""
     ).lower()
+
+    experience = clean_text(
+        job.get("experience")
+        or ""
+    ).lower()
+
+    description = clean_text(
+        job.get("description")
+        or ""
+    ).lower()
+
+    # Check title + experience + description together.
+    text = " ".join(
+        part
+        for part in [
+            title,
+            experience,
+            description,
+        ]
+        if part
+    )
 
     return any(
         re.search(
