@@ -1,14 +1,15 @@
-# AI Job Tracker V2.2.1 - Stable
-# Gemini primary + OpenRouter free fallback
+# AI Job Tracker V2.3 - Gemini + Groq Stable
+# Gemini primary + Groq fallback
 #
 # V2.2.1 fixes:
 # 1) Hard MAX_AI_JOBS limit - never analyzes more than the configured limit
-# 2) OpenRouter HTTP 429 hard-stop - no retry after free-tier quota is exhausted
-# 3) No duplicate OpenRouter retry for invalid JSON
+# 2) Groq HTTP 429 hard-stop - no retry after rate limit is exhausted
+# 3) No duplicate Groq retry for invalid JSON
 # 4) Reliable Google Sheets A:N write + verification
 # 5) Existing legacy J:W records are recognized for duplicate protection
 # 6) Cleaner final statistics and provider status
 # 7) Existing filtering / duplicate logic retained
+# 8) OpenRouter removed; Groq is the only fallback provider
 
 import os
 import re
@@ -30,7 +31,7 @@ SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 WORKSHEET_NAME = "Sheet1"
 
 AI_MODEL = "gemini-3.6-flash"
-OPENROUTER_MODEL = "openrouter/free"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 # HARD LIMIT:
 # The script will never make more than this many AI analysis attempts.
@@ -92,7 +93,7 @@ gemini_client = None
 gemini_available = False
 gemini_rate_limited = False
 
-openrouter_rate_limited = False
+groq_rate_limited = False
 
 # Set this to True when AI processing must stop immediately.
 stop_ai_processing = False
@@ -104,10 +105,10 @@ stats = {
     "duplicate_jobs_skipped": 0,
     "jobs_rejected": 0,
     "adzuna_api_errors": 0,
-    "openrouter_fallback_uses": 0,
-    "openrouter_errors": 0,
-    "openrouter_invalid_json": 0,
-    "openrouter_rate_limit": 0,
+    "groq_fallback_uses": 0,
+    "groq_errors": 0,
+    "groq_invalid_json": 0,
+    "groq_rate_limit": 0,
     "gemini_invalid_json": 0,
 }
 
@@ -211,7 +212,7 @@ def initialize_gemini():
     key = os.environ.get("GEMINI_API_KEY")
 
     if not key:
-        print("Gemini API key not found. OpenRouter will be used.")
+        print("Gemini API key not found. Groq fallback will be used.")
         return
 
     try:
@@ -414,7 +415,7 @@ def analyze_with_gemini(job, profile):
             gemini_available = False
 
             print("⚠️ GEMINI RATE LIMIT / QUOTA REACHED")
-            print("➡️ Switching to OpenRouter FREE fallback.")
+            print("➡️ Switching to Groq fallback.")
 
         else:
             print(f"Gemini error: {exc}")
@@ -424,27 +425,27 @@ def analyze_with_gemini(job, profile):
 
 
 # ============================================================
-# OPENROUTER ANALYSIS
+# GROQ ANALYSIS
 # ============================================================
 
-def analyze_with_openrouter(job, profile):
-    global openrouter_rate_limited
+def analyze_with_groq(job, profile):
+    global groq_rate_limited
     global stop_ai_processing
 
     if stop_ai_processing:
         return None
 
-    if openrouter_rate_limited:
+    if groq_rate_limited:
         return None
 
-    key = os.environ.get("OPENROUTER_API_KEY")
+    key = os.environ.get("GROQ_API_KEY")
 
     if not key:
-        print("OpenRouter API key not found.")
-        stats["openrouter_errors"] += 1
+        print("Groq API key not found.")
+        stats["groq_errors"] += 1
         return None
 
-    print("🔄 Trying OpenRouter FREE fallback...")
+    print("🔄 Trying Groq fallback...")
 
     strict_prompt = build_ai_prompt(job, profile) + """
 IMPORTANT:
@@ -454,7 +455,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
 """
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": GROQ_MODEL,
         "messages": [
             {
                 "role": "user",
@@ -462,7 +463,9 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
             }
         ],
         "temperature": 0.0,
-        "max_tokens": 1000,
+        "max_completion_tokens": 1000,
+        "reasoning_effort": "low",
+        "reasoning_format": "hidden",
         "response_format": {
             "type": "json_object",
         },
@@ -472,11 +475,12 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "X-Title": "AI Job Tracker",
+        "Accept": "application/json",
     }
 
     try:
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=60,
@@ -486,12 +490,12 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         # HARD STOP ON 429
         # ----------------------------------------------------
         if response.status_code == 429:
-            openrouter_rate_limited = True
+            groq_rate_limited = True
             stop_ai_processing = True
-            stats["openrouter_rate_limit"] += 1
+            stats["groq_rate_limit"] += 1
 
             print(
-                "🛑 OpenRouter HTTP 429: free-tier rate limit reached."
+                "🛑 Groq HTTP 429: rate limit reached."
             )
             print(
                 "🛑 Stopping further AI analysis for this run."
@@ -504,11 +508,11 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         # ----------------------------------------------------
         if response.status_code != 200:
             print(
-                f"OpenRouter HTTP {response.status_code}: "
+                f"Groq HTTP {response.status_code}: "
                 f"{response.text[:500]}"
             )
 
-            stats["openrouter_errors"] += 1
+            stats["groq_errors"] += 1
             return None
 
         data = response.json()
@@ -516,8 +520,8 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         choices = data.get("choices") or []
 
         if not choices:
-            print("OpenRouter returned no choices.")
-            stats["openrouter_errors"] += 1
+            print("Groq returned no choices.")
+            stats["groq_errors"] += 1
             return None
 
         message = choices[0].get("message") or {}
@@ -541,35 +545,35 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
 
         if result is not None:
             print(
-                "✅ OpenRouter FREE fallback analysis successful!"
+                "✅ Groq fallback analysis successful!"
             )
             return result
 
         # ----------------------------------------------------
         # INVALID JSON: NO SECOND REQUEST
         # ----------------------------------------------------
-        stats["openrouter_invalid_json"] += 1
+        stats["groq_invalid_json"] += 1
 
         print(
-            "⚠️ OpenRouter returned invalid JSON."
+            "⚠️ Groq returned invalid JSON."
         )
         print(
             f"Raw response: {str(content)[:700]}"
         )
         print(
-            "➡️ Skipping this job without another OpenRouter retry."
+            "➡️ Skipping this job without another Groq retry."
         )
 
         return None
 
     except requests.RequestException as exc:
-        print(f"OpenRouter request error: {exc}")
-        stats["openrouter_errors"] += 1
+        print(f"Groq request error: {exc}")
+        stats["groq_errors"] += 1
         return None
 
     except Exception as exc:
-        print(f"OpenRouter processing error: {exc}")
-        stats["openrouter_errors"] += 1
+        print(f"Groq processing error: {exc}")
+        stats["groq_errors"] += 1
         return None
 
 
@@ -591,20 +595,20 @@ def analyze_job(job, profile):
             print("AI Provider: Gemini")
             return result, "Gemini"
 
-    # Fallback: OpenRouter
+    # Fallback: Groq
     if stop_ai_processing:
         return None, "None"
 
-    stats["openrouter_fallback_uses"] += 1
+    stats["groq_fallback_uses"] += 1
 
-    result = analyze_with_openrouter(
+    result = analyze_with_groq(
         job,
         profile,
     )
 
     if result is not None:
-        print("AI Provider: OpenRouter")
-        return result, "OpenRouter"
+        print("AI Provider: Groq")
+        return result, "Groq"
 
     return None, "None"
 
@@ -1153,9 +1157,9 @@ def main():
     global stop_ai_processing
 
     print("=" * 70)
-    print("AI Job Tracker V2.2.1 Started!")
+    print("AI Job Tracker V2.3 Started!")
     print(
-        "Gemini PRIMARY + OpenRouter FREE FALLBACK"
+        "Gemini PRIMARY + Groq FALLBACK"
     )
     print("=" * 70)
 
@@ -1347,7 +1351,7 @@ def main():
                     )
 
                     # ----------------------------------------
-                    # OPENROUTER QUOTA STOP
+                    # GROQ RATE-LIMIT STOP
                     # ----------------------------------------
                     if (
                         result is None
@@ -1519,20 +1523,20 @@ def main():
         f"{stats['adzuna_api_errors']}"
     )
     print(
-        f"OpenRouter fallback uses: "
-        f"{stats['openrouter_fallback_uses']}"
+        f"Groq fallback uses: "
+        f"{stats['groq_fallback_uses']}"
     )
     print(
-        f"OpenRouter errors: "
-        f"{stats['openrouter_errors']}"
+        f"Groq errors: "
+        f"{stats['groq_errors']}"
     )
     print(
-        f"OpenRouter invalid JSON: "
-        f"{stats['openrouter_invalid_json']}"
+        f"Groq invalid JSON: "
+        f"{stats['groq_invalid_json']}"
     )
     print(
-        f"OpenRouter rate-limit events: "
-        f"{stats['openrouter_rate_limit']}"
+        f"Groq rate-limit events: "
+        f"{stats['groq_rate_limit']}"
     )
     print(
         f"Gemini invalid JSON: "
@@ -1554,19 +1558,19 @@ def main():
             "Gemini status: UNAVAILABLE"
         )
 
-    if openrouter_rate_limited:
+    if groq_rate_limited:
         print(
-            "OpenRouter status: "
+            "Groq status: "
             "RATE LIMIT REACHED → STOPPED"
         )
     elif stop_ai_processing:
         print(
-            "OpenRouter status: "
+            "Groq status: "
             "STOPPED"
         )
     else:
         print(
-            "OpenRouter status: AVAILABLE / NOT RATE-LIMITED"
+            "Groq status: AVAILABLE / NOT RATE-LIMITED"
         )
 
     if ai_counter >= MAX_AI_JOBS:
@@ -1577,7 +1581,7 @@ def main():
 
     print("=" * 70)
     print(
-        "AI Job Tracker V2.2.1 Finished!"
+        "AI Job Tracker V2.3 Finished!"
     )
     print("=" * 70)
 
