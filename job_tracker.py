@@ -1579,19 +1579,53 @@ def main():
                         f"{score}/100"
                     )
 
-                    # ----------------------------------------
-                    # SCORE FILTER
-                    # ----------------------------------------
-                    if score < AI_MIN_SCORE:
-                        print(
-                            "Rejected by AI: "
-                            f"{job['title']}"
-                        )
+                  # ----------------------------------------
+# EXPERIENCE COMPATIBILITY FILTER
+# ----------------------------------------
+experience_match = clean_text(
+    result.get("experience_match")
+).lower()
 
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
-                        continue
+experience_unsuitable_patterns = [
+    "not suitable",
+    "not suitable due",
+    "senior role requirement",
+    "senior-level mismatch",
+    "senior level mismatch",
+    "not compatible",
+    "requires more experience",
+    "experience mismatch",
+    "not suitable for a fresher",
+]
+
+if any(
+    pattern in experience_match
+    for pattern in experience_unsuitable_patterns
+):
+    print(
+        "Rejected by AI due to experience mismatch: "
+        f"{job['title']}"
+    )
+
+    stats[
+        "jobs_rejected"
+    ] += 1
+    continue
+
+
+# ----------------------------------------
+# SCORE FILTER
+# ----------------------------------------
+if score < AI_MIN_SCORE:
+    print(
+        "Rejected by AI: "
+        f"{job['title']}"
+    )
+
+    stats[
+        "jobs_rejected"
+    ] += 1
+    continue
 
                     # ----------------------------------------
                     # NEW MATCHED JOB
