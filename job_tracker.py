@@ -825,6 +825,7 @@ SENIOR_TITLE_PATTERNS = [
 ]
 
 THREE_PLUS_YEAR_PATTERNS = [
+    # Explicit 3+ years
     r"\b3\+?\s*years?\b",
     r"\b4\+?\s*years?\b",
     r"\b5\+?\s*years?\b",
@@ -833,6 +834,19 @@ THREE_PLUS_YEAR_PATTERNS = [
     r"\b8\+?\s*years?\b",
     r"\b9\+?\s*years?\b",
     r"\b10\+?\s*years?\b",
+
+    # Experience ranges: 3-5, 3–5, 3 to 5 years
+    r"\b3\s*(?:-|–|to)\s*\d+\s*years?\b",
+    r"\b4\s*(?:-|–|to)\s*\d+\s*years?\b",
+    r"\b5\s*(?:-|–|to)\s*\d+\s*years?\b",
+    r"\b6\s*(?:-|–|to)\s*\d+\s*years?\b",
+    r"\b7\s*(?:-|–|to)\s*\d+\s*years?\b",
+    r"\b8\s*(?:-|–|to)\s*\d+\s*years?\b",
+
+    # Minimum experience wording
+    r"\bminimum\s+3\s+years?\b",
+    r"\bat\s+least\s+3\s+years?\b",
+    r"\b3\s+or\s+more\s+years?\b",
 ]
 
 
