@@ -2,6 +2,7 @@ name: AI Job Tracker
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "30 3 * * *"
 
@@ -10,30 +11,63 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------
+      # 1. Checkout Repository
+      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+
+      # --------------------------------------------------
+      # 2. Setup Python
+      # --------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
+      # --------------------------------------------------
+      # 3. Install Dependencies
+      # --------------------------------------------------
       - name: Install dependencies
         run: |
           pip install requests gspread google-auth google-genai
 
+
+      # --------------------------------------------------
+      # 4. Test Gemini API
+      # --------------------------------------------------
+      # Gemini quota संपली तरी workflow stop होऊ नये.
+      # job_tracker.py पुढे OpenRouter fallback वापरेल.
+      # --------------------------------------------------
       - name: Test Gemini API
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python gemini_test.py
 
+
+      # --------------------------------------------------
+      # 5. Run AI Job Tracker
+      # --------------------------------------------------
       - name: Run Job Tracker
         env:
+
+          # Adzuna API
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+
+          # Google Sheets Service Account
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+          # Primary AI Provider
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          # Backup AI Provider
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
         run: |
           python job_tracker.py
