@@ -1,4 +1,4 @@
-# AI Job Tracker V2.3.1 - Gemini + Groq Stable
+# AI Job Tracker V2.3.4 - Gemini + Groq Stable
 # Gemini primary + Groq fallback
 #
 # V2.2.1 fixes:
@@ -11,7 +11,10 @@
 # 7) Existing filtering / duplicate logic retained
 # 8) OpenRouter removed; Groq is the only fallback provider
 # 9) Company-name normalization improves duplicate detection (e.g. Cummins vs Cummins Inc.)
-# 10) Sheet header/version log updated to V2.3.1
+# 10) Sheet header/version log updated to V2.3.4
+# 11) 3+ years filter checks title + experience + description
+# 12) AI experience mismatch filter rejects unsuitable AI assessments
+# 13) Matched skills are restricted to skills explicitly supported by the job
 
 import os
 import re
@@ -368,10 +371,17 @@ Required JSON schema:
 
 Output rules:
 - match_score must be an integer from 0 to 100.
-- matched_skills must contain only skills actually present in the
-  candidate profile and relevant to the job.
-- missing_skills should contain important job requirements that are
-  not present in the candidate profile.
+- matched_skills must contain ONLY candidate skills that are:
+  (1) actually present in the candidate profile, AND
+  (2) explicitly mentioned, clearly required, or clearly used in the job title
+      or job description.
+- Do NOT list a candidate skill merely because it is generally relevant to
+  embedded jobs.
+- Do NOT infer that a skill is a match when the job does not mention or
+  clearly require/use it.
+- missing_skills should contain only important skills or technologies that
+  are explicitly required or clearly expected by the job and are not present
+  in the candidate profile.
 - experience_match should briefly describe whether the job experience
   requirement is suitable for the candidate.
 - reason should briefly explain why the score was assigned.
@@ -1077,7 +1087,7 @@ def update_headers(worksheet):
         )
 
         print(
-            "Google Sheet headers verified for V2.3.1!"
+            "Google Sheet headers verified for V2.3.4!"
         )
 
         return True
@@ -1349,7 +1359,7 @@ def main():
     global stop_ai_processing
 
     print("=" * 70)
-    print("AI Job Tracker V2.3.1 Started!")
+    print("AI Job Tracker V2.3.4 Started!")
     print(
         "Gemini PRIMARY + Groq FALLBACK"
     )
@@ -1545,20 +1555,31 @@ def main():
                     # ----------------------------------------
                     # GROQ RATE-LIMIT STOP
                     # ----------------------------------------
-                    if (
-                        result is None
-                        and stop_ai_processing
+                    # EXPERIENCE COMPATIBILITY FILTER
+                    # ----------------------------------------
+                    experience_match = clean_text(
+                        result.get("experience_match")
+                    ).lower()
+
+                    experience_unsuitable_patterns = [
+                        "not suitable",
+                        "not suitable due",
+                        "senior role requirement",
+                        "senior-level mismatch",
+                        "senior level mismatch",
+                        "not compatible",
+                        "requires more experience",
+                        "experience mismatch",
+                        "not suitable for a fresher",
+                    ]
+
+                    if any(
+                        pattern in experience_match
+                        for pattern in experience_unsuitable_patterns
                     ):
                         print(
-                            "🛑 AI processing stopped "
-                            "because the fallback provider "
-                            "reached its rate limit."
-                        )
-                        break
-
-                    if result is None:
-                        print(
-                            "❌ No valid AI analysis available."
+                            "Rejected by AI due to experience mismatch: "
+                            f"{job['title']}"
                         )
 
                         stats[
@@ -1566,66 +1587,19 @@ def main():
                         ] += 1
                         continue
 
-                    score = result[
-                        "match_score"
-                    ]
+                    # ----------------------------------------
+                    # SCORE FILTER
+                    # ----------------------------------------
+                    if score < AI_MIN_SCORE:
+                        print(
+                            "Rejected by AI: "
+                            f"{job['title']}"
+                        )
 
-                    print(
-                        f"AI Provider: "
-                        f"{provider}"
-                    )
-                    print(
-                        f"AI Match Score: "
-                        f"{score}/100"
-                    )
-
-                  # ----------------------------------------
-# EXPERIENCE COMPATIBILITY FILTER
-# ----------------------------------------
-experience_match = clean_text(
-    result.get("experience_match")
-).lower()
-
-experience_unsuitable_patterns = [
-    "not suitable",
-    "not suitable due",
-    "senior role requirement",
-    "senior-level mismatch",
-    "senior level mismatch",
-    "not compatible",
-    "requires more experience",
-    "experience mismatch",
-    "not suitable for a fresher",
-]
-
-if any(
-    pattern in experience_match
-    for pattern in experience_unsuitable_patterns
-):
-    print(
-        "Rejected by AI due to experience mismatch: "
-        f"{job['title']}"
-    )
-
-    stats[
-        "jobs_rejected"
-    ] += 1
-    continue
-
-
-# ----------------------------------------
-# SCORE FILTER
-# ----------------------------------------
-if score < AI_MIN_SCORE:
-    print(
-        "Rejected by AI: "
-        f"{job['title']}"
-    )
-
-    stats[
-        "jobs_rejected"
-    ] += 1
-    continue
+                        stats[
+                            "jobs_rejected"
+                        ] += 1
+                        continue
 
                     # ----------------------------------------
                     # NEW MATCHED JOB
@@ -1807,7 +1781,7 @@ if score < AI_MIN_SCORE:
 
     print("=" * 70)
     print(
-        "AI Job Tracker V2.3.1 Finished!"
+        "AI Job Tracker V2.3.4 Finished!"
     )
     print("=" * 70)
 
