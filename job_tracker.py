@@ -230,27 +230,134 @@ def initialize_gemini():
 # ============================================================
 # AI PROMPT
 # ============================================================
-
 def build_ai_prompt(job, profile):
     return f"""
-You are evaluating a job for an entry-level Electronics and Telecommunication
-Engineering candidate targeting Embedded Systems, Embedded AI, Edge AI, IoT,
-Firmware and Robotics roles.
+You are an intelligent job-matching system evaluating a job for an
+entry-level Electronics and Telecommunication Engineering candidate.
 
-Candidate profile:
+The candidate is specifically targeting:
+- Embedded Systems
+- Embedded Software
+- Firmware
+- Embedded AI
+- Edge AI
+- IoT
+- Robotics
+
+Candidate Profile:
 {json.dumps(profile, ensure_ascii=False)}
 
-Job:
+Job Information:
 Company: {clean_text(job.get("company", "Unknown"))}
 Title: {clean_text(job.get("title", ""))}
 Location: {clean_text(job.get("location", ""))}
+Experience: {clean_text(job.get("experience", ""))}
 Description:
 {clean_text(job.get("description", ""))[:12000]}
 
-Return ONLY one valid JSON object. Do not use Markdown fences.
+Your task is to calculate a fair and consistent match score from 0 to 100.
+
+============================================================
+SCORING RUBRIC
+============================================================
+
+1. ROLE RELEVANCE: 0-30 points
+- Strongly relevant Embedded/Firmware/Embedded Software role:
+  25-30 points
+- Relevant Embedded/IoT/Robotics/Edge AI role:
+  20-27 points
+- Partially relevant Electronics/Software role:
+  10-19 points
+- Mostly unrelated role:
+  0-9 points
+
+2. SKILLS MATCH: 0-40 points
+- Compare the job requirements with the candidate's actual skills.
+- Give higher points when important required skills match.
+- Embedded C, C, C++, Python, ESP32, Arduino, Raspberry Pi,
+  Embedded Linux, GPIO, PWM, UART, SPI, I2C, sensors,
+  hardware debugging, IoT, ROS and robotics skills are especially relevant.
+- Do NOT require every job skill to be present.
+- Missing optional or advanced skills should not heavily reduce the score.
+- Do NOT invent skills that are not present in the candidate profile.
+
+3. EXPERIENCE COMPATIBILITY: 0-15 points
+- Fresher / Entry-level / Junior / 0-2 years:
+  13-15 points
+- Experience requirement is not clearly specified:
+  10-12 points
+- Requires more than 2 years but is otherwise relevant:
+  3-9 points
+- Clearly requires 3+ years and is unsuitable for a fresher:
+  0-2 points
+
+Important:
+If the job does NOT specify experience requirements, do NOT penalize
+the candidate heavily.
+
+4. EDUCATION RELEVANCE: 0-10 points
+- Electronics / Electronics and Telecommunication / Electrical /
+  Instrumentation / Computer or closely related engineering:
+  8-10 points
+- Somewhat related technical education:
+  4-7 points
+- Unrelated education:
+  0-3 points
+
+5. LOCATION: 0-5 points
+- Pune or Remote:
+  5 points
+- Location is not clearly specified:
+  3 points
+- Other location:
+  0-2 points
+
+============================================================
+IMPORTANT MATCHING RULES
+============================================================
+
+- Evaluate the candidate as a FRESHER / ENTRY-LEVEL candidate.
+- A junior or associate-level position can be a strong match.
+- Do NOT reject a job simply because the candidate does not have
+  every listed technology.
+- Do NOT invent candidate experience, skills, certifications or projects.
+- Do NOT assume that missing information means the candidate lacks it.
+- If the job description is incomplete, use the available information
+  and remain neutral about unknown requirements.
+- Senior, Lead, Principal, Manager, Director and similar roles should
+  normally receive a very low experience compatibility score.
+- Focus on actual job requirements, not only the job title.
+- Give a higher score when the role is directly related to Embedded
+  Systems, Embedded Software, Firmware, IoT, Robotics or Edge AI.
+- C / Embedded C / C++ / Python and hardware interfacing experience
+  should be considered relevant for embedded software roles.
+- Hardware, firmware, IoT and software skills can overlap. Evaluate
+  transferable technical skills reasonably.
+
+============================================================
+SCORE INTERPRETATION
+============================================================
+
+90-100 = Excellent match
+80-89  = Very strong match
+70-79  = Strong match
+60-69  = Relevant match
+50-59  = Partial match
+Below 50 = Weak match
+
+The score must reflect the complete profile and job requirements,
+not just the number of exact keyword matches.
+
+============================================================
+OUTPUT
+============================================================
+
+Return ONLY one valid JSON object.
+Do not use Markdown fences.
 Do not add explanations before or after the JSON.
 
-Required schema:
+Required JSON schema:
+
 {{
   "match_score": 0,
   "matched_skills": [],
@@ -259,15 +366,17 @@ Required schema:
   "reason": ""
 }}
 
-Rules:
+Output rules:
 - match_score must be an integer from 0 to 100.
-- Consider role relevance, candidate skills, location, education/experience
-  level and job requirements.
-- Do not invent candidate skills.
-- Keep reason concise.
+- matched_skills must contain only skills actually present in the
+  candidate profile and relevant to the job.
+- missing_skills should contain important job requirements that are
+  not present in the candidate profile.
+- experience_match should briefly describe whether the job experience
+  requirement is suitable for the candidate.
+- reason should briefly explain why the score was assigned.
+- Keep reason concise and factual.
 """
-
-
 # ============================================================
 # JSON EXTRACTION
 # ============================================================
