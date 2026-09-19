@@ -24,14 +24,16 @@
     "programming": [
       "C",
       "C++",
+      "Embedded C",
       "Python"
     ],
     "embedded": [
-      "Embedded C",
+      "Microcontrollers",
       "ESP32",
       "Arduino",
-      "Raspberry Pi",
+      "Raspberry Pi 3 B+",
       "Embedded Linux",
+      "RTOS Fundamentals",
       "GPIO",
       "PWM",
       "Sensor Interfacing",
@@ -42,19 +44,38 @@
       "SPI",
       "I2C"
     ],
-    "iot": [
-      "IoT",
-      "REST API"
-    ],
-    "robotics": [
+    "robotics_drone": [
       "Robotics",
-      "ROS",
-      "Motor Control"
+      "Quadcopter",
+      "KK2 Flight Controller",
+      "ESC",
+      "BLDC Motors",
+      "MPU6050 IMU",
+      "RC Transmitter/Receiver",
+      "Motor/ESC Calibration",
+      "Hardware Integration"
+    ],
+    "sensors_actuators": [
+      "HC-SR04",
+      "PIR",
+      "MPU6050 IMU",
+      "Soil Moisture Sensor",
+      "RGB Modules",
+      "LCD",
+      "L298N Motor Driver",
+      "DC Motors"
     ],
     "tools": [
       "Git",
       "GitHub",
-      "Linux"
+      "GitHub Actions",
+      "Linux",
+      "Shell Scripting",
+      "SSH",
+      "Arduino IDE",
+      "Multimeter",
+      "Oscilloscope",
+      "Google Sheets"
     ]
   }
 }
