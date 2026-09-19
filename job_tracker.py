@@ -297,11 +297,18 @@ def analyze_with_openrouter(job, profile):
 
     print("🔄 Trying OpenRouter FREE fallback...")
 
+    strict_prompt = build_ai_prompt(job, profile) + """
+IMPORTANT:
+Return exactly ONE JSON object and nothing else.
+Use double quotes for every JSON key and string.
+Do not use Markdown, code fences, commentary, or bullet points.
+"""
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": build_ai_prompt(job, profile)}],
-        "temperature": 0.1,
-        "max_tokens": 700,
+        "messages": [{"role": "user", "content": strict_prompt}],
+        "temperature": 0.0,
+        "max_tokens": 1000,
+        "response_format": {"type": "json_object"},
     }
 
     headers = {
@@ -545,20 +552,52 @@ def update_headers(worksheet):
 
 
 def load_existing_job_keys(worksheet):
+    """
+    Load existing jobs from the normal A:N layout.
+
+    Also recognize the older malformed J:W layout so previously saved jobs
+    are not re-added after the sheet layout is repaired.
+    """
     keys = set()
+
     try:
         rows = worksheet.get_all_values()
+
         for row in rows[1:]:
+            # Normal layout: A=Date, B=Company, C=Title, D=Location
             if len(row) >= 4 and (row[1] or row[2]):
-                keys.add(make_job_key(row[1], row[2], row[3]))
+                company = clean_text(row[1])
+                title = clean_text(row[2])
+                location = clean_text(row[3])
+
+                if company or title:
+                    keys.add(make_job_key(company, title, location))
+
+            # Legacy malformed layout seen in previous runs:
+            # J=Date, K=Company, L=Title, M=Location
+            if len(row) >= 13:
+                legacy_company = clean_text(row[10])
+                legacy_title = clean_text(row[11])
+                legacy_location = clean_text(row[12])
+
+                if legacy_company or legacy_title:
+                    keys.add(
+                        make_job_key(
+                            legacy_company,
+                            legacy_title,
+                            legacy_location,
+                        )
+                    )
+
     except Exception as exc:
         print(f"Could not load existing sheet rows: {exc}")
+
     return keys
 
 
 def build_sheet_row(job, result):
     matched = result.get("matched_skills", [])
-    return [
+    row = [
         datetime.now().strftime("%Y-%m-%d"),
         job["company"],
         job["title"],
@@ -575,37 +614,96 @@ def build_sheet_row(job, result):
         result.get("reason", ""),
     ]
 
+    if len(row) != len(HEADERS):
+        raise ValueError(
+            f"Sheet row has {len(row)} columns; expected {len(HEADERS)}."
+        )
+
+    return row
+
+
+def get_next_sheet_row(worksheet):
+    """
+    Find the next row from column A.
+    This avoids gspread append_row/table detection placing new data
+    into a shifted column block.
+    """
+    try:
+        col_a = worksheet.col_values(1)
+        last_nonempty = 0
+
+        for index, value in enumerate(col_a, start=1):
+            if clean_text(value):
+                last_nonempty = index
+
+        return max(2, last_nonempty + 1)
+
+    except Exception as exc:
+        print(f"Could not determine next sheet row: {exc}")
+        raise
+
 
 def append_and_verify_job(worksheet, row, job):
     """
-    Verify by exact company/title/location after append.
-    Also checks that the sheet row count increased.
+    Write explicitly to A:N on the next available row.
+    Then read the exact same range back and verify it.
     """
     try:
-        before = worksheet.get_all_values()
-        before_count = len(before)
-
-        worksheet.append_row(row, value_input_option="USER_ENTERED")
-        time.sleep(1)
-
-        after = worksheet.get_all_values()
-
-        if len(after) <= before_count:
-            print("❌ GOOGLE SHEET VERIFICATION FAILED: row count did not increase.")
+        if len(row) != len(HEADERS):
+            print(
+                f"❌ GOOGLE SHEET ROW ERROR: expected {len(HEADERS)} "
+                f"columns, got {len(row)}."
+            )
             return False
 
-        target = make_job_key(job["company"], job["title"], job["location"])
+        next_row = get_next_sheet_row(worksheet)
+        target_range = f"A{next_row}:N{next_row}"
 
-        for sheet_row in reversed(after[1:]):
-            if len(sheet_row) < 4:
-                continue
-            current = make_job_key(sheet_row[1], sheet_row[2], sheet_row[3])
-            if current == target:
-                print("✅ Google Sheet append verified!")
-                return True
+        print(f"📌 Writing exactly to {target_range}")
 
-        print("❌ GOOGLE SHEET VERIFICATION FAILED: matching row not found.")
-        return False
+        worksheet.update(
+            range_name=target_range,
+            values=[row],
+            value_input_option="USER_ENTERED",
+        )
+
+        time.sleep(1)
+
+        written = worksheet.get(target_range)
+
+        if not written or not written[0]:
+            print("❌ GOOGLE SHEET VERIFICATION FAILED: row is empty.")
+            return False
+
+        saved = written[0]
+
+        if len(saved) < len(HEADERS):
+            print(
+                f"❌ GOOGLE SHEET VERIFICATION FAILED: expected "
+                f"{len(HEADERS)} columns, got {len(saved)}."
+            )
+            return False
+
+        expected_key = make_job_key(
+            job["company"],
+            job["title"],
+            job["location"],
+        )
+
+        saved_key = make_job_key(
+            saved[1],
+            saved[2],
+            saved[3],
+        )
+
+        if saved_key != expected_key:
+            print("❌ GOOGLE SHEET VERIFICATION FAILED: row data mismatch.")
+            print(f"Expected: {expected_key}")
+            print(f"Saved:    {saved_key}")
+            return False
+
+        print(f"✅ Google Sheet append verified at {target_range}!")
+        return True
 
     except Exception as exc:
         print(f"❌ Google Sheet append failed: {exc}")
