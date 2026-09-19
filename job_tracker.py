@@ -1553,7 +1553,28 @@ def main():
                     )
 
                     # ----------------------------------------
-                    # GROQ RATE-LIMIT STOP
+                    # AI ANALYSIS FAILURE / STOP HANDLING
+                    # ----------------------------------------
+                    if result is None:
+                        stats[
+                            "jobs_rejected"
+                        ] += 1
+
+                        if stop_ai_processing:
+                            print(
+                                "🛑 AI processing stopped after "
+                                "provider rate limit."
+                            )
+                            break
+
+                        print(
+                            "⚠️ AI analysis failed for this job; "
+                            "skipping."
+                        )
+                        continue
+
+                    score = result["match_score"]
+
                     # ----------------------------------------
                     # EXPERIENCE COMPATIBILITY FILTER
                     # ----------------------------------------
