@@ -285,26 +285,448 @@ GOOGLE_SERVICE_ACCOUNT_JSON
 V1 is currently functional as a personal job-discovery and tracking system.
 
 ---
+# AI Job Tracker – V2 🤖🚀
 
-## 🚀 Future Improvements – V2
+> An AI-assisted job search and tracking system for Embedded, AI, IoT and Robotics jobs.
 
-Planned improvements include:
+AI Job Tracker V2 is a Python-based job tracking system that automatically finds job opportunities, filters irrelevant jobs, uses AI to compare jobs with a candidate profile, detects duplicates, and stores useful jobs in Google Sheets.
 
-- Multiple job sources
-- Improved company information extraction
-- Better job relevance scoring
-- AI-based resume-to-job matching
-- Resume keyword analysis
-- Email notifications
-- Telegram notifications
-- Web dashboard
-- Application status analytics
-- Advanced job recommendation system
+The project started with a basic rule-based system and was improved step by step by adding AI matching, better filtering, error handling, duplicate protection, and a pending-job processing system.
 
-The architecture is designed so additional job sources and intelligent matching features can be added in future versions.
+
+
+
+
+🤖 V2 AI Matching
+
+The main improvement in V2 is AI-assisted job matching.
+
+Instead of depending only on fixed rules, the system sends suitable job information to an AI model and compares the job with the candidate profile.
+
+The AI analysis can provide:
+
+Match Score
+Matched Skills
+Missing Skills
+Experience Match
+Match Reason
+
+This helps identify how closely a job matches the candidate's skills and experience.
+
+📌 Version History
+V2 — AI-Assisted Job Matching
+
+Status: ✅ Completed
+
+V2 introduced AI-based job analysis.
+
+Main Improvements
+AI job matching
+Candidate profile comparison
+AI match score
+Matched skills
+Missing skills
+Experience matching
+Match explanation
+V2.1 — Reliability Improvements
+
+Status: ✅ Completed
+
+V2.1 improved the reliability of the AI job-processing pipeline.
+
+Improvements
+Better job filtering
+Better senior-level filtering
+Improved duplicate protection
+AI processing limits
+Better Google Sheets handling
+Better workflow statistics
+V2.2 — AI Provider Improvements
+
+Status: ✅ Completed
+
+V2.2 improved AI provider handling and error management.
+
+Improvements
+Gemini as primary AI provider
+Fallback AI support
+Better API error handling
+Better JSON handling
+Protection against repeated API failures
+Improved AI processing control
+V2.3 — Matching & Reliability Improvements
+
+Status: ✅ Completed
+
+V2.3 improved job matching and system reliability.
+
+Improvements
+Company-name normalization
+Better duplicate detection
+Improved experience filtering
+Better AI scoring
+Improved job filtering
+Better fallback handling
+More reliable Google Sheets updates
+V2.4 — AI + Pending Job Queue
+
+Status: ✅ Current
+
+V2.4 is the current version of the project.
+
+The main improvement is the Pending_AI queue.
+
+When a job is discovered but AI analysis cannot be completed, the job can be saved for future processing instead of being lost.
+
+Main Features
+Gemini as primary AI provider
+Groq as fallback provider
+AI rate-limit handling
+Continued job collection
+Pending_AI queue
+Skill grounding
+Job requirement grounding
+Duplicate protection
+AI processing limits
+Better error handling
+⏳ Pending_AI Queue
+
+The Pending_AI queue stores jobs that need AI processing but could not be completely processed during the current run.
+
+Example:
+
+Job Found
+   ↓
+Initial Filtering
+   ↓
+AI Processing
+   ↓
+AI Unavailable
+   ↓
+Pending_AI
+
+This means the system does not simply lose a useful job when an AI provider is temporarily unavailable.
+
+Sheet1 vs Pending_AI
+Sheet	Purpose
+Sheet1	Successfully analyzed and qualified jobs
+Pending_AI	Jobs waiting for future AI processing
+🧠 Skill Grounding
+
+V2.4 also improves the reliability of AI-generated skill information.
+
+The system checks whether reported matched skills are actually supported by:
+
+Candidate profile
+Job requirements
+
+This helps reduce incorrect or unsupported skill matches.
+
+🎯 Target Roles
+
+The system focuses mainly on entry-level roles such as:
+
+Embedded Engineer
+Embedded Software Engineer
+Embedded Systems Engineer
+Firmware Engineer
+Junior Embedded Engineer
+Embedded AI Engineer
+Edge AI Engineer
+IoT Engineer
+Junior IoT Engineer
+Robotics Engineer
+Junior Robotics Engineer
+📍 Target Location
+Main Locations
+Pune, Maharashtra
+Remote opportunities in India
+Experience
+Fresher
+Entry Level
+0–2 years experience
+
+The filtering system removes higher-level positions such as:
+
+Senior
+Lead
+Manager
+Principal
+Architect
+Director
+Higher-experience roles
+🔄 V2 System Architecture
+                    Adzuna Job API
+                           ↓
+                    Python Pipeline
+                           ↓
+                 Job Data Processing
+                           ↓
+              Role / Experience Filter
+                           ↓
+                    Duplicate Check
+                           ↓
+                     AI Analysis
+                    ↙           ↘
+                Gemini          Groq
+                    ↘           ↙
+                     AI Result
+                         ↓
+                Skill Grounding
+                         ↓
+                 Result Validation
+                         ↓
+                ┌────────┴────────┐
+                ↓                 ↓
+            Qualified           Pending
+                ↓                 ↓
+             Sheet1           Pending_AI
+⚙️ Key Features
+🔎 Automated Job Search
+
+Fetches job listings using the Adzuna Job API.
+
+🎯 Smart Job Filtering
+
+Filters jobs according to:
+
+Target role
+Location
+Experience
+Technical relevance
+🤖 AI Job Matching
+
+Compares job requirements with the candidate profile.
+
+📊 AI Match Information
+
+Provides:
+
+Match Score
+Matched Skills
+Missing Skills
+Experience Match
+Match Reason
+♻️ Duplicate Detection
+
+Prevents previously processed jobs from being added again.
+
+📋 Google Sheets Tracking
+
+Stores processed job opportunities in a structured format.
+
+⏳ Pending Job Queue
+
+Stores jobs that could not be processed by AI.
+
+🔄 Automated Execution
+
+GitHub Actions runs the job tracker automatically.
+
+📊 Google Sheets
+
+The project uses Google Sheets to store and track job opportunities.
+
+Sheet1
+
+Sheet1 contains successfully processed and qualified jobs.
+
+Field	Description
+Date	Date the job was added
+Company	Company name
+Job Role	Job title
+Location	Job location
+Salary	Salary information
+Experience	Experience requirement
+Skills	Job skills
+Match Score	AI match score
+Apply Link	Job application link
+Status	Application status
+Matched Skills	Matching skills
+Missing Skills	Missing skills
+Experience Match	Experience compatibility
+Match Reason	Reason for the match
+Pending_AI
+
+Pending_AI contains jobs that were found but could not be completely processed by AI.
+
+It can contain:
+
+Job ID
+Date Added
+Company
+Job Role
+Location
+Salary
+Experience
+Description
+Apply Link
+AI Status
+Failure Reason
+🛠️ Technology Stack
+Technology	Purpose
+Python	Main programming language
+Adzuna API	Job data source
+Google Gemini	Primary AI analysis
+Groq	Fallback AI provider
+Google Sheets	Job tracking
+GitHub Actions	Automation
+GitHub	Source control
+📂 Project Structure
+AI-Job-Tracker/
+│
+├── .github/
+│   └── workflows/
+│       └── main.yml
+│
+├── job_tracker.py
+├── gemini_test.py
+├── profile.json
+├── README.md
+│
+├── 1.png
+├── 2.png
+├── 3.png
+├── 4.png
+├── output.png
+└── project-architecture.png
+🔐 Security
+
+API keys and Google Service Account credentials are stored securely using GitHub Actions Secrets.
+
+Sensitive credentials are not stored directly in the source code.
+
+The project uses protected secrets for:
+
+ADZUNA_APP_ID
+ADZUNA_APP_KEY
+GOOGLE_SERVICE_ACCOUNT_JSON
+GEMINI_API_KEY
+GROQ_API_KEY
+📸 Project Screenshots & Output
+1. System Architecture
+
+2. GitHub Repository
+
+3. GitHub Actions — Successful Run
+
+4. Google Sheets — Sheet1
+
+5. Pending_AI Queue
+
+6. Project Output
+
+📈 V2 Project Status
+V2
+
+✅ Completed
+
+AI job matching
+Candidate profile comparison
+Match score
+Matched skills
+Missing skills
+Experience matching
+Match explanation
+V2.1
+
+✅ Completed
+
+Improved filtering
+Better duplicate protection
+Better workflow handling
+V2.2
+
+✅ Completed
+
+AI provider fallback
+Better API error handling
+Better JSON handling
+V2.3
+
+✅ Completed
+
+Company normalization
+Improved experience filtering
+Better AI scoring
+Improved duplicate detection
+V2.4
+
+✅ Current
+
+Gemini + Groq pipeline
+AI rate-limit handling
+Continued job collection
+Pending_AI queue
+Skill grounding
+Job requirement grounding
+Improved duplicate protection
+---
+
+## 📌 Project Overview
+
+Finding suitable engineering jobs manually can be time-consuming.
+
+A candidate needs to:
+
+- Search different job websites
+- Check job requirements
+- Remove senior-level jobs
+- Compare required skills with personal skills
+- Save useful jobs
+- Avoid duplicate jobs
+- Track application status
+
+AI Job Tracker V2 automates many of these repetitive tasks.
+
+The system combines:
+
+- Job API integration
+- Python automation
+- Job filtering
+- Candidate profile matching
+- AI-based job analysis
+- Duplicate detection
+- Google Sheets
+- GitHub Actions
 
 ---
 
+## 🎯 Problem Statement
+
+Manual job searching has several problems:
+
+- Too many irrelevant job listings
+- Senior-level jobs mixed with entry-level jobs
+- Difficult to compare every job with personal skills
+- Repeated jobs
+- Manual tracking
+- Time-consuming daily searching
+
+The goal of this project is to automate the initial job discovery and matching process.
+
+---
+
+# 💡 V2 Solution
+
+The V2 system follows this workflow:
+
+```text
+Job API
+   ↓
+Python Job Processing
+   ↓
+Role & Experience Filtering
+   ↓
+Duplicate Check
+   ↓
+AI Job Analysis
+   ↓
+Candidate Profile Matching
+   ↓
+Skill & Experience Analysis
+   ↓
+Google Sheets
 ## 🎓 Learning Outcomes
 
 This project provided practical experience with:
