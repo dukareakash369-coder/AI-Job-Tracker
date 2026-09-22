@@ -1,4 +1,6 @@
-# AI Job Tracker – V1.1 🚀
+# AI Job Tracker – V1.1✔️
+# AI Job Tracker – V1.2.4✔️
+# AI Job Tracker – V1.3 in still working 
 
 > An automated job discovery and tracking system for entry-level Embedded, AI, IoT and Robotics opportunities.
 
