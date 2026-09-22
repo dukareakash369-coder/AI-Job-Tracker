@@ -3,7 +3,7 @@
 #
 # V2.2.1 fixes:
 # 1) Hard MAX_AI_JOBS limit - never analyzes more than the configured limit
-# 2) Groq HTTP 429 hard-stop - no retry after rate limit is exhausted
+# 2) Groq HTTP 429 disables Groq for the current run without stopping job collection
 # 3) No duplicate Groq retry for invalid JSON
 # 4) Reliable Google Sheets A:N write + verification
 # 5) Existing legacy J:W records are recognized for duplicate protection
@@ -17,6 +17,8 @@
 # 13) Matched skills are restricted to skills explicitly supported by the job
 # 14) V2.4 deterministic skill grounding removes AI-overclaimed matched skills
 # 15) Missing skills are kept only when explicitly supported by the job text
+# 16) AI-unavailable jobs are preserved in Pending_AI instead of being lost
+# 17) Pending_AI stores job data for future V3 queue processing
 
 import os
 import re
@@ -26,6 +28,7 @@ from datetime import datetime
 
 import requests
 import gspread
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from google import genai
 
@@ -36,6 +39,7 @@ from google import genai
 
 SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 WORKSHEET_NAME = "Sheet1"
+PENDING_WORKSHEET_NAME = "Pending_AI"
 
 AI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
@@ -72,6 +76,20 @@ HEADERS = [
     "Match Reason",
 ]
 
+PENDING_HEADERS = [
+    "Job ID",
+    "Date Added",
+    "Company",
+    "Job Role",
+    "Location",
+    "Salary",
+    "Experience",
+    "Description",
+    "Apply Link",
+    "AI Status",
+    "Failure Reason",
+]
+
 SEARCH_QUERIES = [
     "Embedded Engineer",
     "Embedded Software Engineer",
@@ -102,8 +120,7 @@ gemini_rate_limited = False
 
 groq_rate_limited = False
 
-# Set this to True when AI processing must stop immediately.
-stop_ai_processing = False
+pending_job_keys = set()
 
 stats = {
     "total_jobs_seen": 0,
@@ -622,13 +639,11 @@ def normalize_ai_result(data):
 def analyze_with_gemini(job, profile):
     global gemini_available
     global gemini_rate_limited
-    global stop_ai_processing
 
     if (
         not gemini_available
         or gemini_rate_limited
         or gemini_client is None
-        or stop_ai_processing
     ):
         return None
 
@@ -682,10 +697,6 @@ def analyze_with_gemini(job, profile):
 
 def analyze_with_groq(job, profile):
     global groq_rate_limited
-    global stop_ai_processing
-
-    if stop_ai_processing:
-        return None
 
     if groq_rate_limited:
         return None
@@ -739,18 +750,18 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         )
 
         # ----------------------------------------------------
-        # HARD STOP ON 429
+        # GROQ 429: DISABLE GROQ FOR THIS RUN ONLY
         # ----------------------------------------------------
         if response.status_code == 429:
             groq_rate_limited = True
-            stop_ai_processing = True
             stats["groq_rate_limit"] += 1
 
             print(
                 "🛑 Groq HTTP 429: rate limit reached."
             )
             print(
-                "🛑 Stopping further AI analysis for this run."
+                "➡️ Groq disabled for this run. "
+                "Job collection will continue."
             )
 
             return None
@@ -834,11 +845,6 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
 # ============================================================
 
 def analyze_job(job, profile):
-    global stop_ai_processing
-
-    if stop_ai_processing:
-        return None, "None"
-
     # Primary: Gemini
     if gemini_available and not gemini_rate_limited:
         result = analyze_with_gemini(job, profile)
@@ -848,19 +854,17 @@ def analyze_job(job, profile):
             return result, "Gemini"
 
     # Fallback: Groq
-    if stop_ai_processing:
-        return None, "None"
+    if not groq_rate_limited:
+        stats["groq_fallback_uses"] += 1
 
-    stats["groq_fallback_uses"] += 1
+        result = analyze_with_groq(
+            job,
+            profile,
+        )
 
-    result = analyze_with_groq(
-        job,
-        profile,
-    )
-
-    if result is not None:
-        print("AI Provider: Groq")
-        return result, "Groq"
+        if result is not None:
+            print("AI Provider: Groq")
+            return result, "Groq"
 
     return None, "None"
 
@@ -1089,6 +1093,7 @@ def prepare_job(raw, location):
         salary = "Not specified"
 
     return {
+        "job_id": clean_text(raw.get("id")),
         "title": title,
         "company": company,
         "location": job_location,
@@ -1482,12 +1487,172 @@ def append_and_verify_job(
 
 
 # ============================================================
+# PENDING AI QUEUE
+# ============================================================
+
+def get_or_create_pending_worksheet(worksheet):
+    """Get or create the Pending_AI worksheet."""
+    spreadsheet = worksheet.spreadsheet
+
+    try:
+        pending = spreadsheet.worksheet(PENDING_WORKSHEET_NAME)
+        print("Pending_AI worksheet found.")
+    except WorksheetNotFound:
+        print("Creating Pending_AI worksheet...")
+        pending = spreadsheet.add_worksheet(
+            title=PENDING_WORKSHEET_NAME,
+            rows=1000,
+            cols=len(PENDING_HEADERS),
+        )
+
+    pending.update(
+        range_name="A1:K1",
+        values=[PENDING_HEADERS],
+    )
+    return pending
+
+
+def load_pending_job_keys(pending_worksheet):
+    """Load pending jobs to prevent duplicate pending rows."""
+    keys = set()
+
+    try:
+        rows = pending_worksheet.get_all_values()
+        for row in rows[1:]:
+            if len(row) < 5:
+                continue
+            company = clean_text(row[2])
+            title = clean_text(row[3])
+            location = clean_text(row[4])
+            if company or title:
+                keys.add(make_job_key(company, title, location))
+    except Exception as exc:
+        print(f"Could not load Pending_AI rows: {exc}")
+
+    return keys
+
+
+def build_pending_row(job, failure_reason):
+    """Build a durable V2.4 pending row for future V3 processing."""
+    job_id = clean_text(job.get("job_id")) or "|".join([
+        clean_text(job.get("company")),
+        clean_text(job.get("title")),
+        clean_text(job.get("location")),
+    ])
+
+    row = [
+        job_id,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        job.get("company", ""),
+        job.get("title", ""),
+        job.get("location", ""),
+        job.get("salary", ""),
+        job.get("experience", ""),
+        clean_text(job.get("description", ""))[:20000],
+        job.get("apply_link", ""),
+        "PENDING",
+        failure_reason,
+    ]
+
+    if len(row) != len(PENDING_HEADERS):
+        raise ValueError(
+            f"Pending_AI row has {len(row)} columns; "
+            f"expected {len(PENDING_HEADERS)}."
+        )
+
+    return row
+
+
+def append_pending_job(pending_worksheet, job, failure_reason):
+    """Write a pending job to Pending_AI and verify the write."""
+    key = make_job_key(
+        job["company"],
+        job["title"],
+        job["location"],
+    )
+
+    if key in pending_job_keys:
+        print(
+            "Skipping duplicate Pending_AI job: "
+            f"{job['title']}"
+        )
+        return False
+
+    try:
+        row = build_pending_row(job, failure_reason)
+        next_row = get_next_sheet_row(pending_worksheet)
+        target_range = f"A{next_row}:K{next_row}"
+
+        print(
+            f"📥 Writing pending job to "
+            f"Pending_AI!{target_range}"
+        )
+
+        pending_worksheet.update(
+            range_name=target_range,
+            values=[row],
+            value_input_option="USER_ENTERED",
+        )
+
+        time.sleep(1)
+        written = pending_worksheet.get(target_range)
+
+        if not written or not written[0]:
+            print("❌ Pending_AI verification failed.")
+            return False
+
+        saved = written[0]
+        if len(saved) < len(PENDING_HEADERS):
+            print(
+                "❌ Pending_AI verification failed: "
+                f"expected {len(PENDING_HEADERS)} columns, "
+                f"got {len(saved)}."
+            )
+            return False
+
+        expected_key = key
+        saved_key = make_job_key(saved[2], saved[3], saved[4])
+
+        if saved_key != expected_key:
+            print("❌ Pending_AI verification failed: job key mismatch.")
+            print(f"Expected: {expected_key}")
+            print(f"Saved:    {saved_key}")
+            return False
+
+        pending_job_keys.add(key)
+        print("✅ Job saved successfully to Pending_AI.")
+        return True
+
+    except Exception as exc:
+        print(f"❌ Pending_AI append failed: {exc}")
+        return False
+
+
+def get_ai_failure_reason():
+    """Return the current-run reason for AI unavailability."""
+    reasons = []
+
+    if not gemini_available:
+        if gemini_rate_limited:
+            reasons.append("Gemini rate limit/quota reached")
+        else:
+            reasons.append("Gemini unavailable")
+
+    if groq_rate_limited:
+        reasons.append("Groq rate limit reached")
+    elif not os.environ.get("GROQ_API_KEY"):
+        reasons.append("Groq API key unavailable")
+
+    return " + ".join(reasons) if reasons else "AI analysis failed"
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     global existing_job_keys
-    global stop_ai_processing
+    global pending_job_keys
 
     print("=" * 70)
     print("AI Job Tracker V2.4 Started!")
@@ -1510,13 +1675,26 @@ def main():
 
     update_headers(worksheet)
 
+    pending_worksheet = get_or_create_pending_worksheet(
+        worksheet
+    )
+
     existing_job_keys = load_existing_job_keys(
         worksheet
+    )
+
+    pending_job_keys = load_pending_job_keys(
+        pending_worksheet
     )
 
     print(
         f"Existing jobs in Sheet: "
         f"{len(existing_job_keys)}"
+    )
+
+    print(
+        f"Existing pending jobs: "
+        f"{len(pending_job_keys)}"
     )
 
     ai_counter = 0
@@ -1526,111 +1704,52 @@ def main():
     # ========================================================
 
     for query in SEARCH_QUERIES:
-        if ai_counter >= MAX_AI_JOBS:
-            break
-
-        if stop_ai_processing:
-            break
-
         print("\n" + "=" * 70)
-        print(
-            f"Searching: {query}"
-        )
+        print(f"Searching: {query}")
         print("=" * 70)
 
         for location in LOCATIONS:
-            if ai_counter >= MAX_AI_JOBS:
-                break
+            print(f"\nLocation: {location}")
 
-            if stop_ai_processing:
-                break
-
-            print(
-                f"\nLocation: {location}"
-            )
-
-            for page in range(
-                1,
-                TOTAL_PAGES + 1,
-            ):
-                if ai_counter >= MAX_AI_JOBS:
-                    break
-
-                if stop_ai_processing:
-                    break
-
-                jobs = get_adzuna_jobs(
-                    query,
-                    location,
-                    page,
-                )
+            for page in range(1, TOTAL_PAGES + 1):
+                jobs = get_adzuna_jobs(query, location, page)
 
                 print(
-                    f"Page {page}: "
-                    f"{len(jobs)} jobs received."
+                    f"Page {page}: {len(jobs)} jobs received."
                 )
 
                 if not jobs:
                     continue
 
                 for raw in jobs:
-                    # ----------------------------------------
-                    # HARD STOP BEFORE ANY NEW AI ANALYSIS
-                    # ----------------------------------------
-                    if (
-                        ai_counter
-                        >= MAX_AI_JOBS
-                    ):
-                        break
+                    stats["total_jobs_seen"] += 1
 
-                    if stop_ai_processing:
-                        break
-
-                    stats[
-                        "total_jobs_seen"
-                    ] += 1
-
-                    job = prepare_job(
-                        raw,
-                        location,
-                    )
+                    job = prepare_job(raw, location)
 
                     if not job["title"]:
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
+                        stats["jobs_rejected"] += 1
                         continue
 
                     # ----------------------------------------
                     # SENIOR TITLE FILTER
                     # ----------------------------------------
-                    if is_senior_title(
-                        job["title"]
-                    ):
+                    if is_senior_title(job["title"]):
                         print(
-                            "Rejected senior/lead "
-                            f"title: {job['title']}"
+                            "Rejected senior/lead title: "
+                            f"{job['title']}"
                         )
-
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
+                        stats["jobs_rejected"] += 1
                         continue
 
                     # ----------------------------------------
                     # 3+ YEARS FILTER
                     # ----------------------------------------
-                    if requires_three_plus_years(
-                        job
-                    ):
+                    if requires_three_plus_years(job):
                         print(
                             "Rejected 3+ years: "
                             f"{job['title']}"
                         )
-
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
+                        stats["jobs_rejected"] += 1
                         continue
 
                     # ----------------------------------------
@@ -1647,64 +1766,88 @@ def main():
                             "Skipping duplicate: "
                             f"{job['title']}"
                         )
+                        stats["duplicate_jobs_skipped"] += 1
+                        continue
 
-                        stats[
-                            "duplicate_jobs_skipped"
-                        ] += 1
+                    if key in pending_job_keys:
+                        print(
+                            "Skipping existing Pending_AI job: "
+                            f"{job['title']}"
+                        )
+                        stats["duplicate_jobs_skipped"] += 1
                         continue
 
                     # ----------------------------------------
-                    # HARD AI COUNTER
+                    # AI AVAILABILITY
+                    # ----------------------------------------
+                    ai_provider_available = (
+                        (gemini_available and not gemini_rate_limited)
+                        or
+                        (
+                            bool(os.environ.get("GROQ_API_KEY"))
+                            and not groq_rate_limited
+                        )
+                    )
+
+                    if not ai_provider_available:
+                        print("⚠️ No AI provider available.")
+                        print("➡️ Saving job to Pending_AI.")
+                        append_pending_job(
+                            pending_worksheet,
+                            job,
+                            get_ai_failure_reason(),
+                        )
+                        continue
+
+                    # ----------------------------------------
+                    # HARD AI ATTEMPT LIMIT
+                    # AI limit controls AI calls only.
+                    # It never stops job collection.
                     # ----------------------------------------
                     if ai_counter >= MAX_AI_JOBS:
-                        break
+                        print(
+                            f"⚠️ AI attempt limit reached "
+                            f"({MAX_AI_JOBS})."
+                        )
+                        print("➡️ Saving job to Pending_AI.")
+                        append_pending_job(
+                            pending_worksheet,
+                            job,
+                            "Maximum AI analysis limit reached "
+                            f"({MAX_AI_JOBS})",
+                        )
+                        continue
 
+                    # ----------------------------------------
+                    # AI ANALYSIS
+                    # ----------------------------------------
                     ai_counter += 1
-
-                    stats[
-                        "jobs_analyzed"
-                    ] += 1
+                    stats["jobs_analyzed"] += 1
 
                     print("\n" + "-" * 70)
                     print(
                         f"AI Analysis: "
                         f"{ai_counter}/{MAX_AI_JOBS}"
                     )
-                    print(
-                        f"Job: {job['title']}"
-                    )
-                    print(
-                        f"Company: "
-                        f"{job['company']}"
-                    )
+                    print(f"Job: {job['title']}")
+                    print(f"Company: {job['company']}")
 
-                    result, provider = analyze_job(
-                        job,
-                        profile,
-                    )
+                    result, provider = analyze_job(job, profile)
 
                     # ----------------------------------------
-                    # AI ANALYSIS FAILURE / STOP HANDLING
+                    # AI ANALYSIS FAILURE
                     # ----------------------------------------
                     if result is None:
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
-
-                        if stop_ai_processing:
-                            print(
-                                "🛑 AI processing stopped after "
-                                "provider rate limit."
-                            )
-                            break
-
                         print(
-                            "⚠️ AI analysis failed for this job; "
-                            "skipping."
+                            "⚠️ AI analysis unavailable for this job."
+                        )
+                        print("➡️ Saving job to Pending_AI.")
+                        append_pending_job(
+                            pending_worksheet,
+                            job,
+                            get_ai_failure_reason(),
                         )
                         continue
-
-                    score = result["match_score"]
 
                     # ----------------------------------------
                     # V2.4 JOB REQUIREMENT GROUNDING
@@ -1714,6 +1857,8 @@ def main():
                         job,
                         profile,
                     )
+
+                    score = result["match_score"]
 
                     # ----------------------------------------
                     # EXPERIENCE COMPATIBILITY FILTER
@@ -1742,10 +1887,7 @@ def main():
                             "Rejected by AI due to experience mismatch: "
                             f"{job['title']}"
                         )
-
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
+                        stats["jobs_rejected"] += 1
                         continue
 
                     # ----------------------------------------
@@ -1756,34 +1898,18 @@ def main():
                             "Rejected by AI: "
                             f"{job['title']}"
                         )
-
-                        stats[
-                            "jobs_rejected"
-                        ] += 1
+                        stats["jobs_rejected"] += 1
                         continue
 
                     # ----------------------------------------
                     # NEW MATCHED JOB
                     # ----------------------------------------
                     print("\n" + "=" * 70)
-                    print(
-                        "🎯 NEW AI-MATCHED JOB FOUND"
-                    )
-                    print(
-                        f"Job: {job['title']}"
-                    )
-                    print(
-                        f"Company: "
-                        f"{job['company']}"
-                    )
-                    print(
-                        f"Location: "
-                        f"{job['location']}"
-                    )
-                    print(
-                        f"Salary: "
-                        f"{job['salary']}"
-                    )
+                    print("🎯 NEW AI-MATCHED JOB FOUND")
+                    print(f"Job: {job['title']}")
+                    print(f"Company: {job['company']}")
+                    print(f"Location: {job['location']}")
+                    print(f"Salary: {job['salary']}")
                     print(
                         "Matched Skills: "
                         f"{result['matched_skills']}"
@@ -1796,58 +1922,25 @@ def main():
                         "Experience Match: "
                         f"{result['experience_match']}"
                     )
-                    print(
-                        f"Reason: {result['reason']}"
-                    )
+                    print(f"Reason: {result['reason']}")
 
-                    print(
-                        "\n📊 Writing job "
-                        "to Google Sheet..."
-                    )
+                    print("\n📊 Writing job to Google Sheet...")
 
-                    row = build_sheet_row(
-                        job,
-                        result,
-                    )
+                    row = build_sheet_row(job, result)
 
                     if append_and_verify_job(
                         worksheet,
                         row,
                         job,
                     ):
-                        existing_job_keys.add(
-                            key
-                        )
-
-                        stats[
-                            "new_jobs_added"
-                        ] += 1
-
+                        existing_job_keys.add(key)
+                        stats["new_jobs_added"] += 1
                     else:
                         print(
-                            "❌ Job append could "
-                            "not be verified."
+                            "❌ Job append could not be verified."
                         )
 
                     time.sleep(2)
-
-                    # ----------------------------------------
-                    # FINAL HARD STOP
-                    # ----------------------------------------
-                    if (
-                        ai_counter
-                        >= MAX_AI_JOBS
-                    ):
-                        break
-
-                if stop_ai_processing:
-                    break
-
-            if stop_ai_processing:
-                break
-
-        if stop_ai_processing:
-            break
 
     # ========================================================
     # FINAL SUMMARY
@@ -1904,6 +1997,11 @@ def main():
         f"{stats['gemini_invalid_json']}"
     )
 
+    print(
+        f"Pending jobs saved: "
+        f"{len(pending_job_keys)}"
+    )
+
     # Provider status
     if gemini_rate_limited:
         print(
@@ -1922,12 +2020,7 @@ def main():
     if groq_rate_limited:
         print(
             "Groq status: "
-            "RATE LIMIT REACHED → STOPPED"
-        )
-    elif stop_ai_processing:
-        print(
-            "Groq status: "
-            "STOPPED"
+            "RATE LIMIT REACHED → DISABLED FOR THIS RUN"
         )
     else:
         print(
