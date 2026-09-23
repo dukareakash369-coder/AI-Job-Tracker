@@ -1,5 +1,5 @@
-# AI Job Tracker V2.4 - Gemini + Groq Stable
-# Gemini primary + Groq fallback
+# AI Job Tracker V3 - Persistent Queue + Gemini + Groq
+# V3: persistent queue, retry/backoff, provider health, recovery
 #
 # V2.2.1 fixes:
 # 1) Hard MAX_AI_JOBS limit - never analyzes more than the configured limit
@@ -18,13 +18,16 @@
 # 14) V2.4 deterministic skill grounding removes AI-overclaimed matched skills
 # 15) Missing skills are kept only when explicitly supported by the job text
 # 16) AI-unavailable jobs are preserved in Pending_AI instead of being lost
-# 17) Pending_AI stores job data for future V3 queue processing
+# 18) Pending jobs are processed before new job discovery
+# 19) Retry/backoff, attempt history and stale PROCESSING recovery
+# 20) COMPLETED / REJECTED / FAILED lifecycle states
+# 17) V3 upgrades Pending_AI into a persistent processing queue
 
 import os
 import re
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import gspread
@@ -40,6 +43,7 @@ from google import genai
 SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 WORKSHEET_NAME = "Sheet1"
 PENDING_WORKSHEET_NAME = "Pending_AI"
+FAILED_WORKSHEET_NAME = "Failed_AI"
 
 AI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
@@ -76,6 +80,9 @@ HEADERS = [
     "Match Reason",
 ]
 
+# V3 persistent queue schema.
+# Existing V2.4 rows remain compatible because the first 11 columns
+# keep their original positions; new queue metadata is appended.
 PENDING_HEADERS = [
     "Job ID",
     "Date Added",
@@ -86,9 +93,19 @@ PENDING_HEADERS = [
     "Experience",
     "Description",
     "Apply Link",
-    "AI Status",
+    "Status",
     "Failure Reason",
+    "Retry Count",
+    "Last Attempt",
+    "Next Retry",
+    "Last Provider",
+    "Attempt History",
 ]
+
+# V3 queue / reliability controls.
+MAX_RETRIES = 3
+MAX_PENDING_AI_JOBS = 10
+RETRY_BACKOFF_MINUTES = [5, 15, 60]
 
 SEARCH_QUERIES = [
     "Embedded Engineer",
@@ -120,6 +137,11 @@ gemini_rate_limited = False
 
 groq_rate_limited = False
 
+provider_health = {
+    "Gemini": "UNKNOWN",
+    "Groq": "UNKNOWN",
+}
+
 pending_job_keys = set()
 
 stats = {
@@ -134,6 +156,13 @@ stats = {
     "groq_invalid_json": 0,
     "groq_rate_limit": 0,
     "gemini_invalid_json": 0,
+    "pending_processed": 0,
+    "pending_completed": 0,
+    "pending_retried": 0,
+    "pending_rejected": 0,
+    "pending_failed": 0,
+    "pending_skipped_backoff": 0,
+    "queue_recovered": 0,
 }
 
 existing_job_keys = set()
@@ -236,17 +265,20 @@ def initialize_gemini():
     key = os.environ.get("GEMINI_API_KEY")
 
     if not key:
+        provider_health["Gemini"] = "DISABLED"
         print("Gemini API key not found. Groq fallback will be used.")
         return
 
     try:
         gemini_client = genai.Client(api_key=key)
         gemini_available = True
+        provider_health["Gemini"] = "AVAILABLE"
         print("Gemini client initialized successfully!")
 
     except Exception as exc:
         print(f"Gemini initialization failed: {exc}")
         gemini_available = False
+        provider_health["Gemini"] = "FAILED"
 
 
 # ============================================================
@@ -680,6 +712,7 @@ def analyze_with_gemini(job, profile):
         ):
             gemini_rate_limited = True
             gemini_available = False
+            provider_health["Gemini"] = "RATE_LIMITED"
 
             print("⚠️ GEMINI RATE LIMIT / QUOTA REACHED")
             print("➡️ Switching to Groq fallback.")
@@ -687,6 +720,7 @@ def analyze_with_gemini(job, profile):
         else:
             print(f"Gemini error: {exc}")
             gemini_available = False
+            provider_health["Gemini"] = "FAILED"
 
         return None
 
@@ -699,11 +733,13 @@ def analyze_with_groq(job, profile):
     global groq_rate_limited
 
     if groq_rate_limited:
+        provider_health["Groq"] = "RATE_LIMITED"
         return None
 
     key = os.environ.get("GROQ_API_KEY")
 
     if not key:
+        provider_health["Groq"] = "DISABLED"
         print("Groq API key not found.")
         stats["groq_errors"] += 1
         return None
@@ -754,6 +790,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         # ----------------------------------------------------
         if response.status_code == 429:
             groq_rate_limited = True
+            provider_health["Groq"] = "RATE_LIMITED"
             stats["groq_rate_limit"] += 1
 
             print(
@@ -776,6 +813,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
             )
 
             stats["groq_errors"] += 1
+            provider_health["Groq"] = "FAILED"
             return None
 
         data = response.json()
@@ -807,6 +845,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         )
 
         if result is not None:
+            provider_health["Groq"] = "AVAILABLE"
             print(
                 "✅ Groq fallback analysis successful!"
             )
@@ -832,11 +871,13 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
     except requests.RequestException as exc:
         print(f"Groq request error: {exc}")
         stats["groq_errors"] += 1
+        provider_health["Groq"] = "FAILED"
         return None
 
     except Exception as exc:
         print(f"Groq processing error: {exc}")
         stats["groq_errors"] += 1
+        provider_health["Groq"] = "FAILED"
         return None
 
 
@@ -1487,11 +1528,40 @@ def append_and_verify_job(
 
 
 # ============================================================
-# PENDING AI QUEUE
+# V3 PERSISTENT PENDING AI QUEUE
 # ============================================================
 
+ACTIVE_PENDING_STATUSES = {"PENDING", "PROCESSING", "RETRY"}
+FINAL_PENDING_STATUSES = {"COMPLETED", "REJECTED", "FAILED"}
+
+
+def utc_now():
+    """Return a consistent UTC timestamp for queue scheduling."""
+    return datetime.utcnow()
+
+
+def format_timestamp(value):
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return clean_text(value)
+
+
+def parse_timestamp(value):
+    value = clean_text(value)
+    if not value:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+
 def get_or_create_pending_worksheet(worksheet):
-    """Get or create the Pending_AI worksheet."""
+    """Get or create the V3 Pending_AI worksheet and upgrade its header."""
     spreadsheet = worksheet.spreadsheet
 
     try:
@@ -1501,39 +1571,156 @@ def get_or_create_pending_worksheet(worksheet):
         print("Creating Pending_AI worksheet...")
         pending = spreadsheet.add_worksheet(
             title=PENDING_WORKSHEET_NAME,
-            rows=1000,
+            rows=2000,
             cols=len(PENDING_HEADERS),
         )
 
+    if pending.col_count < len(PENDING_HEADERS):
+        pending.resize(cols=len(PENDING_HEADERS))
+
     pending.update(
-        range_name="A1:K1",
+        range_name=f"A1:{chr(64 + len(PENDING_HEADERS))}1",
         values=[PENDING_HEADERS],
     )
     return pending
 
 
-def load_pending_job_keys(pending_worksheet):
-    """Load pending jobs to prevent duplicate pending rows."""
-    keys = set()
+def get_or_create_failed_worksheet(worksheet):
+    """Get or create the V3 dead-letter worksheet."""
+    spreadsheet = worksheet.spreadsheet
+
+    try:
+        failed = spreadsheet.worksheet(FAILED_WORKSHEET_NAME)
+        print("Failed_AI worksheet found.")
+    except WorksheetNotFound:
+        print("Creating Failed_AI worksheet...")
+        failed = spreadsheet.add_worksheet(
+            title=FAILED_WORKSHEET_NAME,
+            rows=2000,
+            cols=len(PENDING_HEADERS),
+        )
+
+    if failed.col_count < len(PENDING_HEADERS):
+        failed.resize(cols=len(PENDING_HEADERS))
+
+    failed.update(
+        range_name=f"A1:{chr(64 + len(PENDING_HEADERS))}1",
+        values=[PENDING_HEADERS],
+    )
+    return failed
+
+
+def pending_row_to_record(row, row_number):
+    """Convert a Pending_AI spreadsheet row into a V3 queue record."""
+    values = list(row) + [""] * max(0, len(PENDING_HEADERS) - len(row))
+
+    return {
+        "row_number": row_number,
+        "job_id": clean_text(values[0]),
+        "date_added": clean_text(values[1]),
+        "company": clean_text(values[2]),
+        "title": clean_text(values[3]),
+        "location": clean_text(values[4]),
+        "salary": clean_text(values[5]),
+        "experience": clean_text(values[6]),
+        "description": clean_text(values[7]),
+        "apply_link": clean_text(values[8]),
+        "status": clean_text(values[9]).upper() or "PENDING",
+        "failure_reason": clean_text(values[10]),
+        "retry_count": safe_int(values[11], 0),
+        "last_attempt": clean_text(values[12]),
+        "next_retry": clean_text(values[13]),
+        "last_provider": clean_text(values[14]),
+        "attempt_history": clean_text(values[15]),
+    }
+
+
+def pending_record_to_job(record):
+    return {
+        "job_id": record["job_id"],
+        "title": record["title"],
+        "company": record["company"],
+        "location": record["location"],
+        "salary": record["salary"],
+        "experience": record["experience"],
+        "description": record["description"],
+        "apply_link": record["apply_link"],
+    }
+
+
+def load_pending_records(pending_worksheet):
+    """Load all pending records and recover stale PROCESSING rows."""
+    records = []
 
     try:
         rows = pending_worksheet.get_all_values()
-        for row in rows[1:]:
-            if len(row) < 5:
+
+        for row_number, row in enumerate(rows[1:], start=2):
+            if not row or not any(clean_text(x) for x in row):
                 continue
-            company = clean_text(row[2])
-            title = clean_text(row[3])
-            location = clean_text(row[4])
-            if company or title:
-                keys.add(make_job_key(company, title, location))
+
+            record = pending_row_to_record(row, row_number)
+
+            # V2.4 rows have PENDING in column J and no retry metadata.
+            if not record["status"]:
+                record["status"] = "PENDING"
+
+            # A previous GitHub Actions run may have died after setting
+            # PROCESSING. Recover it instead of leaving the job stuck forever.
+            if record["status"] == "PROCESSING":
+                record["status"] = "RETRY"
+                record["failure_reason"] = (
+                    "Recovered stale PROCESSING state from previous run"
+                )
+                record["next_retry"] = format_timestamp(utc_now())
+                stats["queue_recovered"] += 1
+                update_pending_record(
+                    pending_worksheet,
+                    record,
+                    status="RETRY",
+                    failure_reason=record["failure_reason"],
+                    next_retry=record["next_retry"],
+                    append_history="RECOVERED",
+                )
+
+            records.append(record)
+
     except Exception as exc:
-        print(f"Could not load Pending_AI rows: {exc}")
+        print(f"Could not load Pending_AI records: {exc}")
+
+    return records
+
+
+def load_pending_job_keys(pending_worksheet):
+    """Load active pending jobs only; completed/final records do not block rediscovery."""
+    keys = set()
+
+    for record in load_pending_records(pending_worksheet):
+        if record["status"] in ACTIVE_PENDING_STATUSES:
+            if record["company"] or record["title"]:
+                keys.add(
+                    make_job_key(
+                        record["company"],
+                        record["title"],
+                        record["location"],
+                    )
+                )
 
     return keys
 
 
-def build_pending_row(job, failure_reason):
-    """Build a durable V2.4 pending row for future V3 processing."""
+def build_pending_row(
+    job,
+    failure_reason="",
+    status="PENDING",
+    retry_count=0,
+    last_attempt="",
+    next_retry="",
+    last_provider="",
+    attempt_history="",
+    date_added=None,
+):
+    """Build a durable V3 queue row."""
     job_id = clean_text(job.get("job_id")) or "|".join([
         clean_text(job.get("company")),
         clean_text(job.get("title")),
@@ -1542,7 +1729,7 @@ def build_pending_row(job, failure_reason):
 
     row = [
         job_id,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        date_added or format_timestamp(utc_now()),
         job.get("company", ""),
         job.get("title", ""),
         job.get("location", ""),
@@ -1550,8 +1737,13 @@ def build_pending_row(job, failure_reason):
         job.get("experience", ""),
         clean_text(job.get("description", ""))[:20000],
         job.get("apply_link", ""),
-        "PENDING",
+        status,
         failure_reason,
+        retry_count,
+        last_attempt,
+        next_retry,
+        last_provider,
+        attempt_history,
     ]
 
     if len(row) != len(PENDING_HEADERS):
@@ -1563,8 +1755,81 @@ def build_pending_row(job, failure_reason):
     return row
 
 
-def append_pending_job(pending_worksheet, job, failure_reason):
-    """Write a pending job to Pending_AI and verify the write."""
+def update_pending_record(
+    pending_worksheet,
+    record,
+    status=None,
+    failure_reason=None,
+    retry_count=None,
+    last_attempt=None,
+    next_retry=None,
+    last_provider=None,
+    append_history=None,
+):
+    """Update one queue record in-place and preserve all job data."""
+    if status is not None:
+        record["status"] = status
+    if failure_reason is not None:
+        record["failure_reason"] = failure_reason
+    if retry_count is not None:
+        record["retry_count"] = retry_count
+    if last_attempt is not None:
+        record["last_attempt"] = last_attempt
+    if next_retry is not None:
+        record["next_retry"] = next_retry
+    if last_provider is not None:
+        record["last_provider"] = last_provider
+
+    if append_history:
+        timestamp = format_timestamp(utc_now())
+        event = f"{timestamp} | {append_history}"
+        if record["attempt_history"]:
+            record["attempt_history"] += " || " + event
+        else:
+            record["attempt_history"] = event
+
+    row = [
+        record["job_id"],
+        record["date_added"],
+        record["company"],
+        record["title"],
+        record["location"],
+        record["salary"],
+        record["experience"],
+        record["description"][:20000],
+        record["apply_link"],
+        record["status"],
+        record["failure_reason"],
+        record["retry_count"],
+        record["last_attempt"],
+        record["next_retry"],
+        record["last_provider"],
+        record["attempt_history"],
+    ]
+
+    target_range = f"A{record['row_number']}:{chr(64 + len(PENDING_HEADERS))}{record['row_number']}"
+
+    pending_worksheet.update(
+        range_name=target_range,
+        values=[row],
+        value_input_option="USER_ENTERED",
+    )
+
+    return True
+
+
+def append_pending_job(
+    pending_worksheet,
+    job,
+    failure_reason,
+    status="PENDING",
+    retry_count=0,
+    next_retry=None,
+    last_provider="",
+):
+    """Add a new job to the persistent queue and verify the write."""
+    global pending_job_keys
+
     key = make_job_key(
         job["company"],
         job["title"],
@@ -1579,9 +1844,20 @@ def append_pending_job(pending_worksheet, job, failure_reason):
         return False
 
     try:
-        row = build_pending_row(job, failure_reason)
+        now = format_timestamp(utc_now())
+        row = build_pending_row(
+            job,
+            failure_reason=failure_reason,
+            status=status,
+            retry_count=retry_count,
+            last_attempt="",
+            next_retry=next_retry or now,
+            last_provider=last_provider,
+            attempt_history="QUEUED",
+        )
+
         next_row = get_next_sheet_row(pending_worksheet)
-        target_range = f"A{next_row}:K{next_row}"
+        target_range = f"A{next_row}:P{next_row}"
 
         print(
             f"📥 Writing pending job to "
@@ -1602,6 +1878,7 @@ def append_pending_job(pending_worksheet, job, failure_reason):
             return False
 
         saved = written[0]
+
         if len(saved) < len(PENDING_HEADERS):
             print(
                 "❌ Pending_AI verification failed: "
@@ -1615,8 +1892,6 @@ def append_pending_job(pending_worksheet, job, failure_reason):
 
         if saved_key != expected_key:
             print("❌ Pending_AI verification failed: job key mismatch.")
-            print(f"Expected: {expected_key}")
-            print(f"Saved:    {saved_key}")
             return False
 
         pending_job_keys.add(key)
@@ -1629,7 +1904,7 @@ def append_pending_job(pending_worksheet, job, failure_reason):
 
 
 def get_ai_failure_reason():
-    """Return the current-run reason for AI unavailability."""
+    """Return the current provider-health reason."""
     reasons = []
 
     if not gemini_available:
@@ -1646,61 +1921,387 @@ def get_ai_failure_reason():
     return " + ".join(reasons) if reasons else "AI analysis failed"
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def get_retry_delay_minutes(retry_count):
+    index = min(max(retry_count, 0), len(RETRY_BACKOFF_MINUTES) - 1)
+    return RETRY_BACKOFF_MINUTES[index]
+
+
+def calculate_next_retry(retry_count):
+    return format_timestamp(
+        utc_now() + timedelta(minutes=get_retry_delay_minutes(retry_count))
+    )
+
+
+def is_retry_due(record):
+    next_retry = parse_timestamp(record.get("next_retry", ""))
+    if next_retry is None:
+        return True
+    return utc_now() >= next_retry
+
+
+def append_failed_record(failed_worksheet, record, reason, provider=""):
+    """Persist a terminally failed job in the V3 dead-letter queue."""
+    failed_record = dict(record)
+    failed_record["status"] = "FAILED"
+    failed_record["failure_reason"] = reason
+    failed_record["next_retry"] = ""
+    failed_record["last_provider"] = provider or record.get("last_provider", "")
+    failed_record["attempt_history"] = (
+        record.get("attempt_history", "")
+        + (
+            " || " if record.get("attempt_history") else ""
+        )
+        + f"{format_timestamp(utc_now())} | DEAD_LETTER"
+    )
+
+    try:
+        next_row = get_next_sheet_row(failed_worksheet)
+        row = [
+            failed_record["job_id"],
+            failed_record["date_added"],
+            failed_record["company"],
+            failed_record["title"],
+            failed_record["location"],
+            failed_record["salary"],
+            failed_record["experience"],
+            failed_record["description"][:20000],
+            failed_record["apply_link"],
+            failed_record["status"],
+            failed_record["failure_reason"],
+            failed_record["retry_count"],
+            failed_record["last_attempt"],
+            failed_record["next_retry"],
+            failed_record["last_provider"],
+            failed_record["attempt_history"],
+        ]
+        target_range = f"A{next_row}:P{next_row}"
+        failed_worksheet.update(
+            range_name=target_range,
+            values=[row],
+            value_input_option="USER_ENTERED",
+        )
+        print(f"☠️ Job copied to Failed_AI!{target_range}")
+        return True
+    except Exception as exc:
+        print(f"❌ Failed_AI append failed: {exc}")
+        return False
+
+
+def queue_retry_or_fail(
+    pending_worksheet,
+    failed_worksheet,
+    record,
+    reason,
+    provider="",
+):
+    """Retry temporary failures with backoff; then move to Failed_AI."""
+    new_retry_count = record["retry_count"] + 1
+    now = format_timestamp(utc_now())
+
+    if new_retry_count <= MAX_RETRIES:
+        next_retry = calculate_next_retry(new_retry_count - 1)
+
+        update_pending_record(
+            pending_worksheet,
+            record,
+            status="RETRY",
+            failure_reason=reason,
+            retry_count=new_retry_count,
+            last_attempt=now,
+            next_retry=next_retry,
+            last_provider=provider,
+            append_history=(
+                f"RETRY #{new_retry_count}; "
+                f"provider={provider or 'None'}; reason={reason}"
+            ),
+        )
+
+        stats["pending_retried"] += 1
+        print(
+            f"🔁 Pending job scheduled for retry #{new_retry_count} "
+            f"at {next_retry}"
+        )
+        return "RETRY"
+
+    update_pending_record(
+        pending_worksheet,
+        record,
+        status="FAILED",
+        failure_reason=reason,
+        retry_count=new_retry_count,
+        last_attempt=now,
+        next_retry="",
+        last_provider=provider,
+        append_history=(
+            f"FAILED after {new_retry_count} attempts; "
+            f"provider={provider or 'None'}; reason={reason}"
+        ),
+    )
+
+    if append_failed_record(
+        failed_worksheet,
+        record,
+        reason,
+        provider=provider,
+    ):
+        stats["pending_failed"] += 1
+        print("☠️ Pending job moved to Failed_AI dead-letter queue.")
+    else:
+        print("⚠️ Failed_AI copy failed; FAILED state remains in Pending_AI.")
+
+    return "FAILED"
+
+
+def mark_pending_processing(pending_worksheet, record):
+    """Transition a queue item into PROCESSING before calling an AI provider."""
+    now = format_timestamp(utc_now())
+
+    update_pending_record(
+        pending_worksheet,
+        record,
+        status="PROCESSING",
+        last_attempt=now,
+        append_history="PROCESSING",
+    )
+
+
+def complete_pending_job(pending_worksheet, record):
+    """Mark a successfully written Sheet1 job as COMPLETED."""
+    update_pending_record(
+        pending_worksheet,
+        record,
+        status="COMPLETED",
+        failure_reason="",
+        next_retry="",
+        append_history="COMPLETED → Sheet1",
+    )
+    stats["pending_completed"] += 1
+
+
+def reject_pending_job(pending_worksheet, record, reason):
+    """Mark an unsuitable job as REJECTED; do not retry deterministic rejection."""
+    update_pending_record(
+        pending_worksheet,
+        record,
+        status="REJECTED",
+        failure_reason=reason,
+        next_retry="",
+        append_history=f"REJECTED; reason={reason}",
+    )
+    stats["pending_rejected"] += 1
+
+
+def analyze_pending_job(pending_worksheet, failed_worksheet, record, profile):
+    """
+    Process one persisted queue item.
+    Returns True when the item reached a final state or a retry was scheduled.
+    """
+    global existing_job_keys
+
+    if record["status"] in FINAL_PENDING_STATUSES:
+        return True
+
+    if not is_retry_due(record):
+        stats["pending_skipped_backoff"] += 1
+        return False
+
+    job = pending_record_to_job(record)
+    key = make_job_key(job["company"], job["title"], job["location"])
+
+    # A job may already have reached Sheet1 after a previous partial failure.
+    if key in existing_job_keys:
+        complete_pending_job(pending_worksheet, record)
+        return True
+
+    mark_pending_processing(pending_worksheet, record)
+    stats["pending_processed"] += 1
+    stats["jobs_analyzed"] += 1
+
+    print("\n" + "-" * 70)
+    print("🔄 V3 PENDING JOB PROCESSING")
+    print(f"Job: {job['title']}")
+    print(f"Company: {job['company']}")
+    print(f"Retry Count: {record['retry_count']}")
+
+    result, provider = analyze_job(job, profile)
+
+    if result is None:
+        queue_retry_or_fail(
+            pending_worksheet,
+            failed_worksheet,
+            record,
+            get_ai_failure_reason(),
+            provider=provider,
+        )
+        return True
+
+    result = ground_ai_skill_lists(result, job, profile)
+    score = result["match_score"]
+
+    experience_match = clean_text(
+        result.get("experience_match")
+    ).lower()
+
+    experience_unsuitable_patterns = [
+        "not suitable",
+        "not suitable due",
+        "senior role requirement",
+        "senior-level mismatch",
+        "senior level mismatch",
+        "not compatible",
+        "requires more experience",
+        "experience mismatch",
+        "not suitable for a fresher",
+    ]
+
+    if any(
+        pattern in experience_match
+        for pattern in experience_unsuitable_patterns
+    ):
+        reason = "AI experience mismatch"
+        print(f"⛔ Pending job rejected: {job['title']}")
+        reject_pending_job(pending_worksheet, record, reason)
+        return True
+
+    if score < AI_MIN_SCORE:
+        reason = f"AI match score below threshold ({score} < {AI_MIN_SCORE})"
+        print(f"⛔ Pending job rejected: {job['title']} | {reason}")
+        reject_pending_job(pending_worksheet, record, reason)
+        return True
+
+    print("🎯 Pending job qualified.")
+    row = build_sheet_row(job, result)
+
+    if append_and_verify_job(worksheet_global, row, job):
+        existing_job_keys.add(key)
+        stats["new_jobs_added"] += 1
+        complete_pending_job(pending_worksheet, record)
+        return True
+
+    queue_retry_or_fail(
+        pending_worksheet,
+        failed_worksheet,
+        record,
+        "Sheet1 append verification failed",
+        provider=provider,
+    )
+    return True
+
+
+# Global reference used only by the pending processor after Google Sheet connection.
+worksheet_global = None
+
+
+def process_pending_queue(pending_worksheet, failed_worksheet, profile, ai_budget):
+    """Process eligible pending jobs before discovering new jobs."""
+    global worksheet_global
+
+    records = load_pending_records(pending_worksheet)
+
+    eligible = [
+        record
+        for record in records
+        if record["status"] in {"PENDING", "RETRY"}
+        and is_retry_due(record)
+    ]
+
+    if not eligible:
+        print("📭 No pending jobs are currently due for processing.")
+        return ai_budget
+
+    print("\n" + "=" * 70)
+    print(f"🔄 V3 PENDING QUEUE: {len(eligible)} job(s) due")
+    print("=" * 70)
+
+    processed = 0
+
+    for record in eligible:
+        if processed >= min(MAX_PENDING_AI_JOBS, ai_budget):
+            print("⚠️ Pending AI budget reached for this run.")
+            break
+
+        # Every actual AI attempt consumes one run-level budget unit.
+        before_analyzed = stats["jobs_analyzed"]
+
+        analyze_pending_job(
+            pending_worksheet,
+            failed_worksheet,
+            record,
+            profile,
+        )
+
+        if stats["jobs_analyzed"] > before_analyzed:
+            processed += 1
+
+        # If the provider became unavailable, remaining pending jobs stay queued.
+        if (
+            not gemini_available
+            and groq_rate_limited
+        ):
+            print("⚠️ Both AI paths unavailable; remaining pending jobs stay queued.")
+            break
+
+    return max(0, ai_budget - processed)
+
 
 def main():
     global existing_job_keys
     global pending_job_keys
+    global worksheet_global
 
     print("=" * 70)
-    print("AI Job Tracker V2.4 Started!")
-    print(
-        "Gemini PRIMARY + Groq FALLBACK"
-    )
+    print("AI Job Tracker V3 Started!")
+    print("Persistent Queue + Retry + AI Router + Recovery")
     print("=" * 70)
 
     profile = load_candidate_profile()
-
     initialize_gemini()
 
     worksheet = connect_google_sheet()
+    worksheet_global = worksheet
 
     if worksheet is None:
-        print(
-            "Cannot continue without Google Sheet."
-        )
+        print("Cannot continue without Google Sheet.")
         return
 
     update_headers(worksheet)
 
-    pending_worksheet = get_or_create_pending_worksheet(
-        worksheet
-    )
+    pending_worksheet = get_or_create_pending_worksheet(worksheet)
+    failed_worksheet = get_or_create_failed_worksheet(worksheet)
 
-    existing_job_keys = load_existing_job_keys(
-        worksheet
-    )
-
-    pending_job_keys = load_pending_job_keys(
-        pending_worksheet
-    )
+    existing_job_keys = load_existing_job_keys(worksheet)
+    pending_job_keys = load_pending_job_keys(pending_worksheet)
 
     print(
         f"Existing jobs in Sheet: "
         f"{len(existing_job_keys)}"
     )
-
     print(
-        f"Existing pending jobs: "
+        f"Existing active pending jobs: "
         f"{len(pending_job_keys)}"
     )
 
     ai_counter = 0
 
     # ========================================================
-    # SEARCH LOOP
+    # V3 PRIORITY 1: PROCESS PERSISTENT PENDING QUEUE FIRST
+    # ========================================================
+
+    pending_budget = min(MAX_PENDING_AI_JOBS, MAX_AI_JOBS)
+    pending_before = stats["jobs_analyzed"]
+
+    # analyze_job increments jobs_analyzed only inside the provider call.
+    process_pending_queue(
+        pending_worksheet,
+        failed_worksheet,
+        profile,
+        pending_budget,
+    )
+
+    ai_counter += stats["jobs_analyzed"] - pending_before
+
+    # ========================================================
+    # V3 PRIORITY 2: DISCOVER NEW JOBS
     # ========================================================
 
     for query in SEARCH_QUERIES:
@@ -1752,9 +2353,6 @@ def main():
                         stats["jobs_rejected"] += 1
                         continue
 
-                    # ----------------------------------------
-                    # DUPLICATE FILTER
-                    # ----------------------------------------
                     key = make_job_key(
                         job["company"],
                         job["title"],
@@ -1782,8 +2380,7 @@ def main():
                     # ----------------------------------------
                     ai_provider_available = (
                         (gemini_available and not gemini_rate_limited)
-                        or
-                        (
+                        or (
                             bool(os.environ.get("GROQ_API_KEY"))
                             and not groq_rate_limited
                         )
@@ -1796,13 +2393,12 @@ def main():
                             pending_worksheet,
                             job,
                             get_ai_failure_reason(),
+                            status="PENDING",
                         )
                         continue
 
                     # ----------------------------------------
                     # HARD AI ATTEMPT LIMIT
-                    # AI limit controls AI calls only.
-                    # It never stops job collection.
                     # ----------------------------------------
                     if ai_counter >= MAX_AI_JOBS:
                         print(
@@ -1815,11 +2411,12 @@ def main():
                             job,
                             "Maximum AI analysis limit reached "
                             f"({MAX_AI_JOBS})",
+                            status="PENDING",
                         )
                         continue
 
                     # ----------------------------------------
-                    # AI ANALYSIS
+                    # NEW JOB AI ANALYSIS
                     # ----------------------------------------
                     ai_counter += 1
                     stats["jobs_analyzed"] += 1
@@ -1834,9 +2431,6 @@ def main():
 
                     result, provider = analyze_job(job, profile)
 
-                    # ----------------------------------------
-                    # AI ANALYSIS FAILURE
-                    # ----------------------------------------
                     if result is None:
                         print(
                             "⚠️ AI analysis unavailable for this job."
@@ -1846,12 +2440,11 @@ def main():
                             pending_worksheet,
                             job,
                             get_ai_failure_reason(),
+                            status="PENDING",
+                            last_provider=provider,
                         )
                         continue
 
-                    # ----------------------------------------
-                    # V2.4 JOB REQUIREMENT GROUNDING
-                    # ----------------------------------------
                     result = ground_ai_skill_lists(
                         result,
                         job,
@@ -1860,9 +2453,6 @@ def main():
 
                     score = result["match_score"]
 
-                    # ----------------------------------------
-                    # EXPERIENCE COMPATIBILITY FILTER
-                    # ----------------------------------------
                     experience_match = clean_text(
                         result.get("experience_match")
                     ).lower()
@@ -1890,9 +2480,6 @@ def main():
                         stats["jobs_rejected"] += 1
                         continue
 
-                    # ----------------------------------------
-                    # SCORE FILTER
-                    # ----------------------------------------
                     if score < AI_MIN_SCORE:
                         print(
                             "Rejected by AI: "
@@ -1901,9 +2488,6 @@ def main():
                         stats["jobs_rejected"] += 1
                         continue
 
-                    # ----------------------------------------
-                    # NEW MATCHED JOB
-                    # ----------------------------------------
                     print("\n" + "=" * 70)
                     print("🎯 NEW AI-MATCHED JOB FOUND")
                     print(f"Job: {job['title']}")
@@ -1936,8 +2520,16 @@ def main():
                         existing_job_keys.add(key)
                         stats["new_jobs_added"] += 1
                     else:
-                        print(
-                            "❌ Job append could not be verified."
+                        # The job itself was valid; only persistence failed.
+                        # Keep it in the durable queue so it is not lost.
+                        append_pending_job(
+                            pending_worksheet,
+                            job,
+                            "Sheet1 append verification failed",
+                            status="RETRY",
+                            retry_count=1,
+                            next_retry=calculate_next_retry(0),
+                            last_provider=provider,
                         )
 
                     time.sleep(2)
@@ -1947,9 +2539,7 @@ def main():
     # ========================================================
 
     print("\n" + "=" * 70)
-    print(
-        "JOB SEARCH COMPLETED"
-    )
+    print("V3 JOB SEARCH COMPLETED")
     print("=" * 70)
 
     print(
@@ -1971,6 +2561,34 @@ def main():
     print(
         f"Jobs rejected: "
         f"{stats['jobs_rejected']}"
+    )
+    print(
+        f"Pending processed: "
+        f"{stats['pending_processed']}"
+    )
+    print(
+        f"Pending completed: "
+        f"{stats['pending_completed']}"
+    )
+    print(
+        f"Pending retried: "
+        f"{stats['pending_retried']}"
+    )
+    print(
+        f"Pending rejected: "
+        f"{stats['pending_rejected']}"
+    )
+    print(
+        f"Pending failed: "
+        f"{stats['pending_failed']}"
+    )
+    print(
+        f"Pending skipped due to backoff: "
+        f"{stats['pending_skipped_backoff']}"
+    )
+    print(
+        f"Queue recoveries: "
+        f"{stats['queue_recovered']}"
     )
     print(
         f"Adzuna API errors: "
@@ -1997,48 +2615,41 @@ def main():
         f"{stats['gemini_invalid_json']}"
     )
 
+    # Reload active queue count after all updates.
+    final_pending_records = load_pending_records(pending_worksheet)
+    active_pending = [
+        r for r in final_pending_records
+        if r["status"] in ACTIVE_PENDING_STATUSES
+    ]
+
     print(
-        f"Pending jobs saved: "
-        f"{len(pending_job_keys)}"
+        f"Active pending jobs: "
+        f"{len(active_pending)}"
     )
 
-    # Provider status
-    if gemini_rate_limited:
-        print(
-            "Gemini status: "
-            "RATE LIMIT / QUOTA REACHED"
-        )
-    elif gemini_available:
-        print(
-            "Gemini status: AVAILABLE"
-        )
-    else:
-        print(
-            "Gemini status: UNAVAILABLE"
-        )
-
-    if groq_rate_limited:
-        print(
-            "Groq status: "
-            "RATE LIMIT REACHED → DISABLED FOR THIS RUN"
-        )
-    else:
-        print(
-            "Groq status: AVAILABLE / NOT RATE-LIMITED"
-        )
-
-    if ai_counter >= MAX_AI_JOBS:
-        print(
-            f"AI limit reached cleanly: "
-            f"{ai_counter}/{MAX_AI_JOBS}"
-        )
-
-    print("=" * 70)
+    failed_records = failed_worksheet.get_all_values()
     print(
-        "AI Job Tracker V2.4 Finished!"
+        f"Dead-letter Failed_AI jobs: "
+        f"{max(0, len(failed_records) - 1)}"
     )
-    print("=" * 70)
 
+    print(
+        f"Gemini provider health: "
+        f"{provider_health.get('Gemini', 'UNKNOWN')}"
+    )
+    print(
+        f"Groq provider health: "
+        f"{provider_health.get('Groq', 'UNKNOWN')}"
+    )
+
+    print(
+        f"AI budget used: "
+        f"{ai_counter}/{MAX_AI_JOBS}"
+    )
+
+    print("=" * 70)
+    print("AI Job Tracker V3 Finished!")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
