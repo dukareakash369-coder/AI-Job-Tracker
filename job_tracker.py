@@ -1,4 +1,4 @@
-# AI Job Tracker V3 - Persistent Queue + Gemini + Groq
+# AI Job Tracker V3 - Persistent Queue + Gemini + Groq + OpenAI
 # V3: persistent queue, retry/backoff, provider health, recovery
 #
 # V2.2.1 fixes:
@@ -9,7 +9,7 @@
 # 5) Existing legacy J:W records are recognized for duplicate protection
 # 6) Cleaner final statistics and provider status
 # 7) Existing filtering / duplicate logic retained
-# 8) OpenRouter removed; Groq is the only fallback provider
+# 8) OpenRouter removed; Groq + OpenAI are fallback providers
 # 9) Company-name normalization improves duplicate detection (e.g. Cummins vs Cummins Inc.)
 # 10) Sheet header/version log updated to V2.4
 # 11) 3+ years filter checks title + experience + description
@@ -47,6 +47,7 @@ FAILED_WORKSHEET_NAME = "Failed_AI"
 
 AI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
+OPENAI_MODEL = "gpt-5.6-luna"
 
 # HARD LIMIT:
 # The script will never make more than this many AI analysis attempts.
@@ -135,11 +136,15 @@ gemini_client = None
 gemini_available = False
 gemini_rate_limited = False
 
+openai_available = False
+openai_rate_limited = False
+
 groq_rate_limited = False
 
 provider_health = {
     "Gemini": "UNKNOWN",
     "Groq": "UNKNOWN",
+    "OpenAI": "UNKNOWN",
 }
 
 pending_job_keys = set()
@@ -156,6 +161,10 @@ stats = {
     "groq_invalid_json": 0,
     "groq_rate_limit": 0,
     "gemini_invalid_json": 0,
+    "openai_fallback_uses": 0,
+    "openai_errors": 0,
+    "openai_invalid_json": 0,
+    "openai_rate_limit": 0,
     "pending_processed": 0,
     "pending_completed": 0,
     "pending_retried": 0,
@@ -907,7 +916,136 @@ def analyze_job(job, profile):
             print("AI Provider: Groq")
             return result, "Groq"
 
+    # Third provider: OpenAI
+    if openai_available and not openai_rate_limited:
+        stats["openai_fallback_uses"] += 1
+
+        result = analyze_with_openai(
+            job,
+            profile,
+        )
+
+        if result is not None:
+            print("AI Provider: OpenAI")
+            return result, "OpenAI"
+
     return None, "None"
+
+
+# ============================================================
+# OPENAI ANALYSIS
+# ============================================================
+
+def analyze_with_openai(job, profile):
+    """Use OpenAI as the third AI fallback provider."""
+    global openai_available
+    global openai_rate_limited
+
+    if not openai_available or openai_rate_limited:
+        return None
+
+    key = os.environ.get("OPENAI_API_KEY")
+
+    if not key:
+        provider_health["OpenAI"] = "DISABLED"
+        return None
+
+    print("🔄 Trying OpenAI fallback...")
+
+    strict_prompt = build_ai_prompt(job, profile) + """
+IMPORTANT:
+Return exactly ONE JSON object and nothing else.
+Use double quotes for every JSON key and string.
+Do not use Markdown, code fences, commentary, reasoning, or bullet points.
+"""
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": strict_prompt,
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_object",
+            }
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+
+        if response.status_code == 429:
+            openai_rate_limited = True
+            openai_available = False
+            provider_health["OpenAI"] = "RATE_LIMITED"
+            stats["openai_rate_limit"] += 1
+
+            print("🛑 OpenAI HTTP 429: rate limit reached.")
+            print("➡️ OpenAI disabled for this run.")
+            return None
+
+        if response.status_code != 200:
+            print(
+                f"OpenAI HTTP {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+            stats["openai_errors"] += 1
+            provider_health["OpenAI"] = "FAILED"
+            return None
+
+        data = response.json()
+
+        content = data.get("output_text", "")
+
+        if not content:
+            parts = []
+            for item in data.get("output", []) or []:
+                for part in item.get("content", []) or []:
+                    text = part.get("text")
+                    if text:
+                        parts.append(str(text))
+            content = "\n".join(parts)
+
+        result = normalize_ai_result(
+            extract_json_object(content)
+        )
+
+        if result is not None:
+            provider_health["OpenAI"] = "AVAILABLE"
+            print("✅ OpenAI fallback analysis successful!")
+            return result
+
+        stats["openai_invalid_json"] += 1
+        print("⚠️ OpenAI returned invalid JSON.")
+        print(f"Raw response: {str(content)[:700]}")
+        print("➡️ Skipping this job without another OpenAI retry.")
+        return None
+
+    except requests.RequestException as exc:
+        print(f"OpenAI request error: {exc}")
+        stats["openai_errors"] += 1
+        provider_health["OpenAI"] = "FAILED"
+        return None
+
+    except Exception as exc:
+        print(f"OpenAI processing error: {exc}")
+        stats["openai_errors"] += 1
+        provider_health["OpenAI"] = "FAILED"
+        return None
 
 
 # ============================================================
@@ -1918,6 +2056,12 @@ def get_ai_failure_reason():
     elif not os.environ.get("GROQ_API_KEY"):
         reasons.append("Groq API key unavailable")
 
+    if not openai_available:
+        if openai_rate_limited:
+            reasons.append("OpenAI rate limit reached")
+        else:
+            reasons.append("OpenAI unavailable")
+
     return " + ".join(reasons) if reasons else "AI analysis failed"
 
 
@@ -2237,8 +2381,9 @@ def process_pending_queue(pending_worksheet, failed_worksheet, profile, ai_budge
         if (
             not gemini_available
             and groq_rate_limited
+            and not openai_available
         ):
-            print("⚠️ Both AI paths unavailable; remaining pending jobs stay queued.")
+            print("⚠️ All AI providers unavailable; remaining pending jobs stay queued.")
             break
 
     return max(0, ai_budget - processed)
@@ -2256,6 +2401,18 @@ def main():
 
     profile = load_candidate_profile()
     initialize_gemini()
+
+    global openai_available
+    global openai_rate_limited
+
+    if os.environ.get("OPENAI_API_KEY"):
+        openai_available = True
+        provider_health["OpenAI"] = "AVAILABLE"
+        print("OpenAI provider configured successfully!")
+    else:
+        openai_available = False
+        provider_health["OpenAI"] = "DISABLED"
+        print("OpenAI API key not found. OpenAI fallback disabled.")
 
     worksheet = connect_google_sheet()
     worksheet_global = worksheet
@@ -2383,6 +2540,11 @@ def main():
                         or (
                             bool(os.environ.get("GROQ_API_KEY"))
                             and not groq_rate_limited
+                        )
+                        or (
+                            bool(os.environ.get("OPENAI_API_KEY"))
+                            and openai_available
+                            and not openai_rate_limited
                         )
                     )
 
@@ -2611,6 +2773,22 @@ def main():
         f"{stats['groq_rate_limit']}"
     )
     print(
+        f"OpenAI fallback uses: "
+        f"{stats['openai_fallback_uses']}"
+    )
+    print(
+        f"OpenAI errors: "
+        f"{stats['openai_errors']}"
+    )
+    print(
+        f"OpenAI invalid JSON: "
+        f"{stats['openai_invalid_json']}"
+    )
+    print(
+        f"OpenAI rate-limit events: "
+        f"{stats['openai_rate_limit']}"
+    )
+    print(
         f"Gemini invalid JSON: "
         f"{stats['gemini_invalid_json']}"
     )
@@ -2640,6 +2818,10 @@ def main():
     print(
         f"Groq provider health: "
         f"{provider_health.get('Groq', 'UNKNOWN')}"
+    )
+    print(
+        f"OpenAI provider health: "
+        f"{provider_health.get('OpenAI', 'UNKNOWN')}"
     )
 
     print(
