@@ -2,9 +2,9 @@
 
 > **Automated AI-powered job discovery, matching, tracking, and retry/recovery system for entry-level Embedded, Embedded AI, Edge AI, IoT, and Robotics roles.**
 
-AI Job Tracker started as a rule-based job search automation and has evolved into a **V3 persistent, quota-aware AI processing pipeline**.
+AI Job Tracker started as a rule-based job-search automation and evolved into a **V3 persistent, AI-assisted processing pipeline**.
 
-The system discovers jobs from the **Adzuna Job API**, applies deterministic filtering and duplicate protection, compares suitable jobs against a candidate profile using AI, validates the result, and stores qualified opportunities in **Google Sheets**.
+The system discovers relevant job listings, applies deterministic filtering and duplicate protection, compares suitable jobs with a candidate profile using AI, validates the result, and stores qualified opportunities in **Google Sheets**.
 
 ---
 
@@ -12,12 +12,12 @@ The system discovers jobs from the **Adzuna Job API**, applies deterministic fil
 
 Manual job searching requires repeatedly:
 
-- Searching multiple job listings
+- Searching job listings
 - Removing senior-level and unsuitable roles
 - Comparing job requirements with personal skills
 - Checking for duplicate opportunities
 - Tracking useful jobs
-- Handling temporary AI/API failures
+- Handling temporary AI-processing failures
 
 AI Job Tracker automates this initial workflow while keeping the final application decision with the candidate.
 
@@ -26,7 +26,7 @@ AI Job Tracker automates this initial workflow while keeping the final applicati
 ```text
                     JOB DISCOVERY
                          ↓
-                 Adzuna Job API
+                 Job Data Source
                          ↓
                 Initial Filtering
                          ↓
@@ -40,7 +40,8 @@ AI Job Tracker automates this initial workflow while keeping the final applicati
                          ↓
                      AI ROUTER
                    ↙     ↓      ↘
-               Gemini   Groq    OpenAI
+              Primary  Fallback  Fallback
+                AI        AI        AI
                    ↘     ↓      ↙
                      AI RESULT
                          ↓
@@ -101,11 +102,7 @@ The AI layer compares a discovered job with the candidate profile and produces s
 | Experience Match | Compatibility with the candidate's experience level |
 | Match Reason | Explanation for the generated result |
 
-The current minimum AI score for adding a qualified job to **Sheet1** is:
-
-```text
-AI_MIN_SCORE = 60
-```
+The current minimum score for adding a qualified job to **Sheet1** is configured in the project.
 
 AI is used to enrich and evaluate suitable jobs; deterministic filtering remains responsible for initial job eligibility.
 
@@ -117,7 +114,7 @@ AI is used to enrich and evaluate suitable jobs; deterministic filtering remains
 
 The first version used:
 
-- Adzuna API
+- Job listing data
 - Python filtering
 - Role filtering
 - Experience filtering
@@ -128,7 +125,7 @@ The first version used:
 - GitHub Actions
 
 ```text
-Adzuna
+Job Data
    ↓
 Python
    ↓
@@ -148,7 +145,7 @@ Google Sheets
 V2 introduced AI-based candidate/job comparison.
 
 ```text
-Adzuna
+Job Data
    ↓
 Python Filtering
    ↓
@@ -210,16 +207,15 @@ V3 upgrades the Pending_AI mechanism into a **persistent processing queue**.
 - Persistent Pending_AI queue
 - Retry and backoff
 - Stale PROCESSING recovery
-- Provider health tracking
-- Quota-aware provider switching
-- Gemini → Groq → OpenAI fallback routing
+- AI provider health tracking
+- Automatic provider switching
 - Failed_AI dead-letter queue
 - Attempt history
 - Maximum retry protection
-- AI processing limit
+- AI processing limits
 - Duplicate protection
 - Google Sheets verification
-- Safe V3 test harness
+- Safe deterministic test harness
 
 ---
 
@@ -269,30 +265,24 @@ This makes the workflow persistent instead of depending on a single successful r
 
 # 🤖 AI Provider Router
 
-V3 supports multiple AI providers.
+V3 supports multiple AI providers through a fallback routing layer.
 
 ```text
                  AI ROUTER
                      │
              ┌───────┼────────┐
              ↓       ↓        ↓
-          Gemini    Groq     OpenAI
           Primary  Fallback  Fallback
+             AI       AI        AI
              │       │        │
              └───────┼────────┘
                      ↓
                  AI Result
 ```
 
-### Provider configuration
+When the active provider returns a temporary failure or rate-limit response, the router can switch to another available provider without stopping the complete workflow.
 
-| Provider | Role | Current model |
-|---|---|---|
-| Google Gemini | Primary | `gemini-3.6-flash` |
-| Groq | Fallback | `openai/gpt-oss-20b` |
-| OpenAI | Third fallback | `gpt-5.6-luna` |
-
-When a provider returns a rate-limit/quota error, the router can mark that provider unavailable for the run and continue with the next eligible provider.
+Provider names, API endpoints, model identifiers, quotas, and credentials are intentionally **not documented in this public README**.
 
 ---
 
@@ -302,17 +292,17 @@ V3 stores provider usage and health information in the **AI_Provider_State** wor
 
 | Field | Purpose |
 |---|---|
-| Provider | AI provider name |
+| Provider | AI provider identifier |
 | Quota Day | Date associated with usage state |
 | Calls Used | Locally tracked calls |
-| Daily Budget | Configured soft budget |
+| Daily Budget | Configured routing budget |
 | Status | Provider health state |
 | Last Event | Latest provider event |
 | Updated At | State update timestamp |
 
-The stored state allows provider routing information to survive between GitHub Actions runs.
+The stored state allows provider-routing information to survive between automated runs.
 
-> **Note:** The local daily budget is a routing-control limit. It does not represent the provider's actual remaining external quota.
+> **Note:** Local budget values are routing controls. They do not represent an external provider's actual remaining quota.
 
 ---
 
@@ -343,19 +333,13 @@ The **Pending_AI** worksheet stores jobs that require later processing.
 
 ### Retry backoff
 
-The current retry schedule is:
-
 ```text
 Retry 1 → 5 minutes
 Retry 2 → 15 minutes
 Retry 3 → 60 minutes
 ```
 
-Maximum retries:
-
-```text
-MAX_RETRIES = 3
-```
+Maximum retries are limited by the project configuration.
 
 ---
 
@@ -363,7 +347,7 @@ MAX_RETRIES = 3
 
 Jobs that cannot be processed successfully after the configured retry limit are moved to **Failed_AI**.
 
-This prevents permanently failing jobs from repeatedly consuming AI processing capacity.
+This prevents permanently failing jobs from repeatedly consuming processing capacity.
 
 ```text
 Pending_AI
@@ -416,15 +400,7 @@ Application status values include:
 
 # ⚙️ GitHub Actions Automation
 
-The workflow runs automatically through GitHub Actions.
-
-Current schedule:
-
-```text
-30 3 * * *
-```
-
-The workflow can also be started manually using `workflow_dispatch`.
+The workflow runs automatically through GitHub Actions and can also be started manually.
 
 ### Execution flow
 
@@ -433,15 +409,15 @@ GitHub Actions
       ↓
 Checkout Repository
       ↓
-Python 3.11
+Python Environment
       ↓
-Install Dependencies
+Dependency Installation
       ↓
-Gemini API Test
+AI Connectivity Test
       ↓
 Run job_tracker.py
       ↓
-Adzuna → AI Router → Google Sheets
+Job Discovery → AI Router → Google Sheets
 ```
 
 ---
@@ -451,14 +427,12 @@ Adzuna → AI Router → Google Sheets
 | Technology | Purpose |
 |---|---|
 | Python | Main automation and processing |
-| Adzuna Job API | Job discovery |
-| Google Gemini | Primary AI analysis |
-| Groq | AI fallback |
-| OpenAI | Third AI fallback |
+| Job Listing API | Job discovery |
+| AI Services | Candidate/job analysis |
 | Google Sheets | Persistent job storage |
 | GitHub Actions | Scheduled automation |
 | GitHub | Source control |
-| JSON | Candidate profile / structured AI data |
+| JSON | Candidate profile and structured data |
 | REST APIs | External service integration |
 
 ---
@@ -480,29 +454,27 @@ AI-Job-Tracker/
 ├── 1.png
 ├── 2.png
 ├── 3.png
-├── 4.png
-├── output.png
-└── project-architecture.png
+└── 4.png
 ```
 
 ---
 
 # 🔐 Security
 
-Credentials are stored using **GitHub Actions Secrets** rather than hard-coded API keys.
+Sensitive implementation details are intentionally kept out of the public documentation.
 
-The workflow uses secrets such as:
+Credentials and service-account information are stored using **GitHub Actions Secrets** rather than hard-coded in the source code.
 
-```text
-ADZUNA_APP_ID
-ADZUNA_APP_KEY
-GOOGLE_SERVICE_ACCOUNT_JSON
-GEMINI_API_KEY
-GROQ_API_KEY
-OPENAI_API_KEY
-```
+The public README does **not** contain:
 
-No secret values are included in the source code or README.
+- API keys
+- Service-account credentials
+- Spreadsheet IDs
+- Private endpoints
+- Provider quotas
+- Provider model identifiers
+- Authentication tokens
+- Other credential values
 
 ---
 
@@ -525,74 +497,59 @@ The test harness checks behaviors such as:
 - Recovery of stale PROCESSING jobs
 - Queue state transitions
 
-Production behavior remains unchanged when:
-
-```text
-V3_TEST_MODE=false
-```
+Production behavior remains unchanged when test mode is disabled.
 
 ---
 
-# 📈 Observed V3 Run
+# 📈 Final V3 Workflow Output
 
-A V3 workflow run demonstrated the persistent queue and provider-routing logic.
+The following is the **actual observed V3 workflow run summary**, rather than the older V1 output.
 
-Example observed processing:
+![AI Job Tracker V3 Workflow Output](./v3-output.svg)
 
-- Jobs seen: **217**
-- Jobs analyzed: **5**
-- Duplicate jobs skipped: **90**
-- Jobs rejected: **123**
-- Pending jobs processed: **5**
-- Provider quota/rate-limit switches: **3**
+### Observed run statistics
 
-The run also demonstrated:
+| Metric | Result |
+|---|---:|
+| Total jobs seen | 217 |
+| Jobs analyzed | 5 |
+| New AI-matched jobs added | 0 |
+| Duplicate jobs skipped | 90 |
+| Jobs rejected | 123 |
+| Pending jobs processed | 5 |
+| Pending completed | 0 |
+| Pending retried | 1 |
+| Pending rejected | 4 |
+| Pending failed | 0 |
+| Provider switching events | 3 |
+
+### Observed V3 behavior
 
 ```text
-Gemini rate limit
-      ↓
-Groq fallback
-      ↓
-Groq processing
+AI provider failure
+       ↓
+Fallback provider
+       ↓
+Successful processing OR next fallback
+       ↓
+If processing still unavailable
+       ↓
+Pending_AI
+       ↓
+Retry / Backoff
 ```
 
-and:
+This run demonstrated the intended **provider switching, persistent queue, retry, and failure-handling behavior**.
 
-```text
-Groq rate limit
-      ↓
-OpenAI fallback
-      ↓
-OpenAI rate limit
-      ↓
-Pending_AI retry
-```
-
-This run verified the intended V3 failure-handling and provider-switching behavior.
+> The run produced 0 new qualified Sheet1 additions because the analyzed jobs in that run did not satisfy the configured qualification threshold. This is an observed run result, not a fabricated success example.
 
 ---
 
-# 📸 Project Screenshots
+# 📸 Project Documentation
 
-### System Architecture
+The README now documents the **V3 workflow output** above instead of presenting the older V1 output as the final result.
 
-![AI Job Tracker Architecture](./project-architecture.png)
-
-### GitHub Repository
-
-![GitHub Repository](./1.png)
-
-### GitHub Actions
-
-![GitHub Actions](./2.png)
-
-### Google Sheets
-
-![Google Sheets](./3.png)
-
-### Project Output
-
-![Project Output](./output.png)
+The V3 architecture and processing lifecycle are represented directly in this README so that the documentation remains aligned with the current implementation.
 
 ---
 
@@ -608,7 +565,7 @@ This project provides practical experience with:
 - AI-assisted matching
 - Prompt engineering
 - Structured AI output
-- Google Sheets API
+- Google Sheets integration
 - GitHub Actions
 - Secrets management
 - Retry/backoff systems
@@ -658,12 +615,6 @@ Interested in:
 # ⭐ Project Goal
 
 > **Automate repetitive job discovery, compare opportunities with a candidate profile, preserve jobs during temporary failures, and maintain a structured job-tracking workflow.**
-
-### Repository
-
-**AI Job Tracker — Automated AI-Powered Job Matching and Tracking System**
-
-[GitHub Repository](https://github.com/dukareakash369-coder/AI-Job-Tracker)
 
 ---
 
