@@ -1,5 +1,5 @@
-# AI Job Tracker V3 - Persistent Queue + Gemini + Groq + OpenAI + Safe Test Harness
-# V3: persistent queue, retry/backoff, provider health, recovery
+# AI Job Tracker V3 - Persistent Queue + Quota-Aware Gemini + Groq + OpenAI + Safe Test Harness
+# V3: persistent queue, retry/backoff, provider health, recovery, quota-aware AI switching
 #
 # V2.2.1 fixes:
 # 1) Hard MAX_AI_JOBS limit - never analyzes more than the configured limit
@@ -44,6 +44,26 @@ SPREADSHEET_ID = "1TeQSVAHVitgB2T6iBte-MOjHQeyHR-RS0HwTltgjIRo"
 WORKSHEET_NAME = "Sheet1"
 PENDING_WORKSHEET_NAME = "Pending_AI"
 FAILED_WORKSHEET_NAME = "Failed_AI"
+
+# Persistent provider-usage state. This survives between GitHub Actions runs.
+PROVIDER_STATE_WORKSHEET_NAME = "AI_Provider_State"
+PROVIDER_STATE_HEADERS = [
+    "Provider",
+    "Quota Day",
+    "Calls Used",
+    "Daily Budget",
+    "Status",
+    "Last Event",
+    "Updated At",
+]
+
+# Soft per-day request budgets. These are configurable through GitHub Actions
+# environment variables and are intentionally conservative defaults.
+PROVIDER_DAILY_BUDGETS = {
+    "Gemini": int(os.environ.get("GEMINI_DAILY_BUDGET", "10")),
+    "Groq": int(os.environ.get("GROQ_DAILY_BUDGET", "10")),
+    "OpenAI": int(os.environ.get("OPENAI_DAILY_BUDGET", "5")),
+}
 
 AI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
@@ -157,6 +177,14 @@ provider_health = {
     "OpenAI": "UNKNOWN",
 }
 
+# Persistent quota-aware switching state.
+provider_usage = {
+    "Gemini": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
+    "Groq": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
+    "OpenAI": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
+}
+provider_state_worksheet = None
+
 pending_job_keys = set()
 
 stats = {
@@ -175,6 +203,8 @@ stats = {
     "openai_errors": 0,
     "openai_invalid_json": 0,
     "openai_rate_limit": 0,
+    "provider_quota_switches": 0,
+    "provider_budget_skips": 0,
     "pending_processed": 0,
     "pending_completed": 0,
     "pending_retried": 0,
@@ -734,6 +764,7 @@ def analyze_with_gemini(job, profile):
             gemini_rate_limited = True
             gemini_available = False
             provider_health["Gemini"] = "RATE_LIMITED"
+            mark_provider_rate_limited("Gemini", "API rate limit/quota reached")
 
             print("⚠️ GEMINI RATE LIMIT / QUOTA REACHED")
             print("➡️ Switching to Groq fallback.")
@@ -813,6 +844,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
             groq_rate_limited = True
             provider_health["Groq"] = "RATE_LIMITED"
             stats["groq_rate_limit"] += 1
+            mark_provider_rate_limited("Groq", "HTTP 429 rate limit")
 
             print(
                 "🛑 Groq HTTP 429: rate limit reached."
@@ -907,42 +939,54 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
 # ============================================================
 
 def analyze_job(job, profile):
-    # Primary: Gemini
-    if gemini_available and not gemini_rate_limited:
-        result = analyze_with_gemini(job, profile)
+    """
+    Quota-aware sequential AI router.
+
+    Order is always Gemini -> Groq -> OpenAI. A provider is skipped when:
+    - its API key is missing,
+    - its persistent daily budget is exhausted,
+    - it was rate-limited earlier in the same day/run,
+    - or it is otherwise unavailable.
+
+    This means a later workflow can continue from the next provider instead
+    of restarting the first provider at every scheduled run.
+    """
+    providers = ("Gemini", "Groq", "OpenAI")
+
+    for provider in providers:
+        if not provider_can_be_used(provider):
+            continue
+
+        if not reserve_provider_call(provider):
+            continue
+
+        if provider == "Gemini":
+            result = analyze_with_gemini(job, profile)
+        elif provider == "Groq":
+            stats["groq_fallback_uses"] += 1
+            result = analyze_with_groq(job, profile)
+        else:
+            stats["openai_fallback_uses"] += 1
+            result = analyze_with_openai(job, profile)
 
         if result is not None:
-            print("AI Provider: Gemini")
-            return result, "Gemini"
+            mark_provider_success(provider)
+            print(f"AI Provider: {provider}")
+            return result, provider
 
-    # Fallback: Groq
-    if not groq_rate_limited:
-        stats["groq_fallback_uses"] += 1
-
-        result = analyze_with_groq(
-            job,
-            profile,
-        )
-
-        if result is not None:
-            print("AI Provider: Groq")
-            return result, "Groq"
-
-    # Third provider: OpenAI
-    if openai_available and not openai_rate_limited:
-        stats["openai_fallback_uses"] += 1
-
-        result = analyze_with_openai(
-            job,
-            profile,
-        )
-
-        if result is not None:
-            print("AI Provider: OpenAI")
-            return result, "OpenAI"
+        # A failed provider may have become RATE_LIMITED. If it failed for
+        # another reason, the next provider is still tried for this job.
+        if provider == "Gemini":
+            if gemini_rate_limited:
+                print("🔀 Gemini unavailable for this quota window → Groq.")
+        elif provider == "Groq":
+            if groq_rate_limited:
+                print("🔀 Groq unavailable for this quota window → OpenAI.")
+        elif provider == "OpenAI":
+            if openai_rate_limited:
+                print("🔀 OpenAI unavailable for this quota window.")
 
     return None, "None"
-
 
 # ============================================================
 # OPENAI ANALYSIS
@@ -1005,6 +1049,7 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
             openai_available = False
             provider_health["OpenAI"] = "RATE_LIMITED"
             stats["openai_rate_limit"] += 1
+            mark_provider_rate_limited("OpenAI", "HTTP 429 rate limit")
 
             print("🛑 OpenAI HTTP 429: rate limit reached.")
             print("➡️ OpenAI disabled for this run.")
@@ -1058,6 +1103,247 @@ Do not use Markdown, code fences, commentary, reasoning, or bullet points.
         stats["openai_errors"] += 1
         provider_health["OpenAI"] = "FAILED"
         return None
+
+
+# ============================================================
+# QUOTA-AWARE AI PROVIDER SWITCHING
+# ============================================================
+
+def quota_day():
+    """Use India time (UTC+05:30) for the daily provider budget window."""
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+
+
+def get_provider_budget(provider):
+    return max(0, PROVIDER_DAILY_BUDGETS.get(provider, 0))
+
+
+def provider_has_key(provider):
+    if provider == "Gemini":
+        return bool(os.environ.get("GEMINI_API_KEY"))
+    if provider == "Groq":
+        return bool(os.environ.get("GROQ_API_KEY"))
+    if provider == "OpenAI":
+        return bool(os.environ.get("OPENAI_API_KEY"))
+    return False
+
+
+def get_or_create_provider_state_worksheet(worksheet):
+    """Create/load the persistent provider state sheet."""
+    global provider_state_worksheet
+
+    spreadsheet = worksheet.spreadsheet
+
+    try:
+        state_ws = spreadsheet.worksheet(PROVIDER_STATE_WORKSHEET_NAME)
+        print("AI_Provider_State worksheet found.")
+    except WorksheetNotFound:
+        print("Creating AI_Provider_State worksheet...")
+        state_ws = spreadsheet.add_worksheet(
+            title=PROVIDER_STATE_WORKSHEET_NAME,
+            rows=20,
+            cols=len(PROVIDER_STATE_HEADERS),
+        )
+
+    if state_ws.col_count < len(PROVIDER_STATE_HEADERS):
+        state_ws.resize(cols=len(PROVIDER_STATE_HEADERS))
+
+    state_ws.update(
+        range_name=f"A1:{chr(64 + len(PROVIDER_STATE_HEADERS))}1",
+        values=[PROVIDER_STATE_HEADERS],
+    )
+
+    provider_state_worksheet = state_ws
+    return state_ws
+
+
+def persist_provider_state(provider, event=None, status=None):
+    """Persist one provider's quota state immediately after a change."""
+    global provider_state_worksheet
+
+    if provider_state_worksheet is None:
+        return
+
+    state = provider_usage[provider]
+    if status is not None:
+        state["status"] = status
+    if event:
+        state["last_event"] = event
+
+    values = [
+        provider,
+        state["quota_day"],
+        state["calls"],
+        get_provider_budget(provider),
+        state["status"],
+        state["last_event"],
+        format_timestamp(utc_now()),
+    ]
+
+    try:
+        rows = provider_state_worksheet.get_all_values()
+        target_row = None
+
+        for row_number, row in enumerate(rows[1:], start=2):
+            if row and clean_text(row[0]).lower() == provider.lower():
+                target_row = row_number
+                break
+
+        if target_row is None:
+            target_row = max(2, len(rows) + 1)
+
+        target_range = f"A{target_row}:{chr(64 + len(PROVIDER_STATE_HEADERS))}{target_row}"
+        provider_state_worksheet.update(
+            range_name=target_range,
+            values=[values],
+            value_input_option="USER_ENTERED",
+        )
+    except Exception as exc:
+        # Provider state persistence must never crash the job tracker.
+        print(f"⚠️ Provider state save failed for {provider}: {exc}")
+
+
+def load_provider_state():
+    """
+    Load persistent daily usage. If the day changed, reset all provider
+    counters. Quota exhaustion/rate-limit state is retained for the same day.
+    """
+    today = quota_day()
+
+    try:
+        rows = provider_state_worksheet.get_all_values()
+    except Exception as exc:
+        print(f"⚠️ Could not read AI_Provider_State: {exc}")
+        rows = []
+
+    saved = {}
+    for row in rows[1:]:
+        if not row:
+            continue
+        provider = clean_text(row[0])
+        if provider not in provider_usage:
+            continue
+
+        saved[provider] = {
+            "quota_day": clean_text(row[1]) if len(row) > 1 else "",
+            "calls": safe_int(row[2], 0) if len(row) > 2 else 0,
+            "status": clean_text(row[4]).upper() if len(row) > 4 else "",
+            "last_event": clean_text(row[5]) if len(row) > 5 else "",
+        }
+
+    for provider in provider_usage:
+        previous = saved.get(provider, {})
+        same_day = previous.get("quota_day") == today
+
+        if same_day:
+            provider_usage[provider]["quota_day"] = today
+            provider_usage[provider]["calls"] = max(0, previous.get("calls", 0))
+            old_status = previous.get("status", "")
+            provider_usage[provider]["status"] = (
+                old_status if old_status in {"QUOTA_EXHAUSTED", "RATE_LIMITED"}
+                else "AVAILABLE"
+            )
+            provider_usage[provider]["last_event"] = previous.get("last_event", "")
+        else:
+            provider_usage[provider]["quota_day"] = today
+            provider_usage[provider]["calls"] = 0
+            provider_usage[provider]["status"] = (
+                "AVAILABLE" if provider_has_key(provider) else "DISABLED"
+            )
+            provider_usage[provider]["last_event"] = "Daily quota window reset"
+
+        # Do not persist a provider as available when its API key is absent.
+        if not provider_has_key(provider):
+            provider_usage[provider]["status"] = "DISABLED"
+
+        persist_provider_state(
+            provider,
+            event=provider_usage[provider]["last_event"],
+            status=provider_usage[provider]["status"],
+        )
+
+    print("\n🔀 QUOTA-AWARE AI PROVIDER STATE")
+    for provider in ("Gemini", "Groq", "OpenAI"):
+        state = provider_usage[provider]
+        print(
+            f"{provider}: {state['calls']}/{get_provider_budget(provider)} "
+            f"| {state['status']}"
+        )
+
+
+def provider_can_be_used(provider):
+    """Return True only when the provider has quota and is currently healthy."""
+    if not provider_has_key(provider):
+        provider_usage[provider]["status"] = "DISABLED"
+        return False
+
+    # Runtime provider health still matters after a persisted daily reset.
+    if provider == "Gemini" and (not gemini_available or gemini_rate_limited):
+        return False
+    if provider == "Groq" and groq_rate_limited:
+        return False
+    if provider == "OpenAI" and (not openai_available or openai_rate_limited):
+        return False
+
+    budget = get_provider_budget(provider)
+    state = provider_usage[provider]
+
+    if budget <= 0:
+        state["status"] = "QUOTA_EXHAUSTED"
+        persist_provider_state(provider, event="Daily budget configured as 0")
+        return False
+
+    if state["calls"] >= budget:
+        if state["status"] != "QUOTA_EXHAUSTED":
+            stats["provider_budget_skips"] += 1
+            stats["provider_quota_switches"] += 1
+            print(
+                f"🔀 {provider} daily budget reached "
+                f"({state['calls']}/{budget}). Switching provider."
+            )
+        state["status"] = "QUOTA_EXHAUSTED"
+        persist_provider_state(provider, event="Daily budget reached")
+        return False
+
+    if state["status"] in {"QUOTA_EXHAUSTED", "RATE_LIMITED"}:
+        return False
+
+    return True
+
+
+def reserve_provider_call(provider):
+    """
+    Reserve one provider request before making the network call.
+    This prevents multiple workflow steps in the same run from crossing
+    the configured persistent daily budget.
+    """
+    if not provider_can_be_used(provider):
+        return False
+
+    state = provider_usage[provider]
+    state["calls"] += 1
+    state["status"] = "AVAILABLE"
+    persist_provider_state(
+        provider,
+        event=f"Reserved AI request #{state['calls']}",
+        status="AVAILABLE",
+    )
+    return True
+
+
+def mark_provider_rate_limited(provider, event):
+    state = provider_usage[provider]
+    state["status"] = "RATE_LIMITED"
+    state["last_event"] = event
+    persist_provider_state(provider, event=event, status="RATE_LIMITED")
+    stats["provider_quota_switches"] += 1
+
+
+def mark_provider_success(provider):
+    state = provider_usage[provider]
+    state["status"] = "AVAILABLE"
+    state["last_event"] = "Successful AI response"
+    persist_provider_state(provider, event=state["last_event"], status="AVAILABLE")
 
 
 # ============================================================
@@ -2653,12 +2939,14 @@ def process_pending_queue(pending_worksheet, failed_worksheet, profile, ai_budge
             processed += 1
 
         # If the provider became unavailable, remaining pending jobs stay queued.
-        if (
-            not gemini_available
-            and groq_rate_limited
-            and not openai_available
+        if not any(
+            provider_can_be_used(provider)
+            for provider in ("Gemini", "Groq", "OpenAI")
         ):
-            print("⚠️ All AI providers unavailable; remaining pending jobs stay queued.")
+            print(
+                "⚠️ All AI providers unavailable or daily budgets exhausted; "
+                "remaining pending jobs stay queued."
+            )
             break
 
     return max(0, ai_budget - processed)
@@ -2700,6 +2988,10 @@ def main():
 
     pending_worksheet = get_or_create_pending_worksheet(worksheet)
     failed_worksheet = get_or_create_failed_worksheet(worksheet)
+
+    # Persistent daily quota state powers cross-workflow AI switching.
+    get_or_create_provider_state_worksheet(worksheet)
+    load_provider_state()
 
     existing_job_keys = load_existing_job_keys(worksheet)
     pending_job_keys = load_pending_job_keys(pending_worksheet)
@@ -2819,17 +3111,9 @@ def main():
                     # ----------------------------------------
                     # AI AVAILABILITY
                     # ----------------------------------------
-                    ai_provider_available = (
-                        (gemini_available and not gemini_rate_limited)
-                        or (
-                            bool(os.environ.get("GROQ_API_KEY"))
-                            and not groq_rate_limited
-                        )
-                        or (
-                            bool(os.environ.get("OPENAI_API_KEY"))
-                            and openai_available
-                            and not openai_rate_limited
-                        )
+                    ai_provider_available = any(
+                        provider_can_be_used(provider)
+                        for provider in ("Gemini", "Groq", "OpenAI")
                     )
 
                     if not ai_provider_available:
@@ -3075,6 +3359,18 @@ def main():
     print(
         f"Gemini invalid JSON: "
         f"{stats['gemini_invalid_json']}"
+    )
+
+    print("\n🔀 Persistent AI Provider Usage:")
+    for provider in ("Gemini", "Groq", "OpenAI"):
+        state = provider_usage[provider]
+        print(
+            f"{provider}: {state['calls']}/{get_provider_budget(provider)} "
+            f"| {state['status']}"
+        )
+    print(
+        f"Provider quota switches: "
+        f"{stats['provider_quota_switches']}"
     )
 
     # Reload active queue count after all updates.
