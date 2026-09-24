@@ -454,7 +454,10 @@ AI-Job-Tracker/
 ├── 1.png
 ├── 2.png
 ├── 3.png
-└── 4.png
+├── 4.png
+├── 5.png
+├── 6.png
+└── 7.png
 ```
 
 ---
@@ -547,9 +550,37 @@ This run demonstrated the intended **provider switching, persistent queue, retry
 
 # 📸 Project Documentation
 
-The README now documents the **V3 workflow output** above instead of presenting the older V1 output as the final result.
+The repository contains screenshots from both the earlier **V1 implementation** and the current **V3 implementation**.
 
-The V3 architecture and processing lifecycle are represented directly in this README so that the documentation remains aligned with the current implementation.
+## V1 — Original Output & Screenshots
+
+The following images document the earlier V1 rule-based workflow and its output:
+
+![V1 Output / Screenshot 1](./1.png)
+
+![V1 Output / Screenshot 2](./2.png)
+
+![V1 Output / Screenshot 3](./3.png)
+
+![V1 Output / Screenshot 4](./4.png)
+
+## V3 — Current Implementation Output
+
+The following images document the current V3 implementation:
+
+- **5.png** — V3 GitHub repository / project state
+- **6.png** — V3 GitHub Actions workflow execution
+- **7.png** — V3 Google Sheets processing / queue data
+
+![V3 GitHub Repository](./5.png)
+
+![V3 GitHub Actions](./6.png)
+
+![V3 Google Sheets / Pending Queue](./7.png)
+
+These screenshots are presented separately so the project evolution from **V1 → V3** is clear and the older V1 output is not mistaken for the final implementation.
+
+The V3 workflow summary above provides the corresponding processing statistics and lifecycle details.
 
 ---
 
