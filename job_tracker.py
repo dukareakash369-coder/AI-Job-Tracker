@@ -2415,12 +2415,13 @@ def run_v3_test_scenario(
             raise RuntimeError("Crash recovery test failed: stale PROCESSING was not recovered to RETRY.")
         print("✅ Crash recovery state transition verified: PROCESSING → RETRY")
 
-    # Test jobs use deterministic analysis inside analyze_pending_job.
-    process_pending_queue(
+    # Process only this synthetic test record. Do not consume the test
+    # budget on unrelated real Pending_AI jobs that may already be due.
+    analyze_pending_job(
         pending_worksheet,
         failed_worksheet,
+        test_record,
         profile,
-        ai_budget=1,
     )
 
     final_records = load_pending_records(pending_worksheet)
