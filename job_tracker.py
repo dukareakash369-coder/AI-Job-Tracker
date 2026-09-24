@@ -1,4 +1,4 @@
-# AI Job Tracker V3 - Persistent Queue + Gemini + Groq + OpenAI
+# AI Job Tracker V3 - Persistent Queue + Gemini + Groq + OpenAI + Safe Test Harness
 # V3: persistent queue, retry/backoff, provider health, recovery
 #
 # V2.2.1 fixes:
@@ -108,6 +108,16 @@ MAX_RETRIES = 3
 MAX_PENDING_AI_JOBS = 10
 RETRY_BACKOFF_MINUTES = [5, 15, 60]
 
+# ------------------------------------------------------------
+# SAFE V3 TEST HARNESS
+# ------------------------------------------------------------
+# Disabled by default. Production behavior is unchanged when
+# V3_TEST_MODE is not set to true.
+TEST_MODE = os.environ.get("V3_TEST_MODE", "false").strip().lower() == "true"
+TEST_SCENARIO = os.environ.get("V3_TEST_SCENARIO", "all").strip().lower()
+TEST_JOB_PREFIX = "V3-TEST-"
+STALE_PROCESSING_MINUTES = 15
+
 SEARCH_QUERIES = [
     "Embedded Engineer",
     "Embedded Software Engineer",
@@ -172,6 +182,8 @@ stats = {
     "pending_failed": 0,
     "pending_skipped_backoff": 0,
     "queue_recovered": 0,
+    "test_passed": 0,
+    "test_failed": 0,
 }
 
 existing_job_keys = set()
@@ -1804,22 +1816,31 @@ def load_pending_records(pending_worksheet):
                 record["status"] = "PENDING"
 
             # A previous GitHub Actions run may have died after setting
-            # PROCESSING. Recover it instead of leaving the job stuck forever.
+            # PROCESSING. Recover only genuinely stale PROCESSING rows so a
+            # currently active job is not reset by another run.
             if record["status"] == "PROCESSING":
-                record["status"] = "RETRY"
-                record["failure_reason"] = (
-                    "Recovered stale PROCESSING state from previous run"
+                last_attempt = parse_timestamp(record.get("last_attempt", ""))
+                stale = (
+                    last_attempt is None
+                    or utc_now() - last_attempt
+                    >= timedelta(minutes=STALE_PROCESSING_MINUTES)
                 )
-                record["next_retry"] = format_timestamp(utc_now())
-                stats["queue_recovered"] += 1
-                update_pending_record(
-                    pending_worksheet,
-                    record,
-                    status="RETRY",
-                    failure_reason=record["failure_reason"],
-                    next_retry=record["next_retry"],
-                    append_history="RECOVERED",
-                )
+
+                if stale:
+                    record["status"] = "RETRY"
+                    record["failure_reason"] = (
+                        "Recovered stale PROCESSING state from previous run"
+                    )
+                    record["next_retry"] = format_timestamp(utc_now())
+                    stats["queue_recovered"] += 1
+                    update_pending_record(
+                        pending_worksheet,
+                        record,
+                        status="RETRY",
+                        failure_reason=record["failure_reason"],
+                        next_retry=record["next_retry"],
+                        append_history="RECOVERED",
+                    )
 
             records.append(record)
 
@@ -2235,6 +2256,255 @@ def reject_pending_job(pending_worksheet, record, reason):
     stats["pending_rejected"] += 1
 
 
+def build_test_job(scenario):
+    """Create an isolated synthetic job used only by the V3 test harness."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    title_map = {
+        "pending_to_sheet1": "V3 TEST - Pending to Sheet1",
+        "failed_ai": "V3 TEST - Failed AI Dead Letter",
+        "crash_recovery": "V3 TEST - Crash Recovery",
+    }
+    title = title_map.get(scenario, "V3 TEST - Queue Test")
+
+    return {
+        "job_id": f"{TEST_JOB_PREFIX}{scenario}-{stamp}",
+        "title": f"{title} - {stamp}",
+        "company": "V3 Test Harness",
+        "location": "Pune",
+        "salary": "Test only",
+        "experience": "0-2 years",
+        "description": (
+            "Synthetic V3 test job. Entry-level Embedded Software Engineer "
+            "role requiring C, Embedded C and Python. This record is created "
+            "only to validate the V3 queue lifecycle."
+        ),
+        "apply_link": "https://example.com/v3-test",
+    }
+
+
+def append_test_pending_job(
+    pending_worksheet,
+    job,
+    status="PENDING",
+    retry_count=0,
+    last_attempt="",
+    next_retry=None,
+    failure_reason="V3 test harness",
+):
+    """Insert one isolated synthetic queue item and verify the write."""
+    global pending_job_keys
+
+    key = make_job_key(job["company"], job["title"], job["location"])
+    now = format_timestamp(utc_now())
+    row = build_pending_row(
+        job,
+        failure_reason=failure_reason,
+        status=status,
+        retry_count=retry_count,
+        last_attempt=last_attempt,
+        next_retry=next_retry or now,
+        last_provider="TEST",
+        attempt_history="TEST_QUEUED",
+    )
+
+    next_row = get_next_sheet_row(pending_worksheet)
+    target_range = f"A{next_row}:P{next_row}"
+    pending_worksheet.update(
+        range_name=target_range,
+        values=[row],
+        value_input_option="USER_ENTERED",
+    )
+    saved = pending_worksheet.get(target_range)
+
+    if not saved or not saved[0] or len(saved[0]) < len(PENDING_HEADERS):
+        raise RuntimeError(f"V3 test queue write verification failed at {target_range}")
+
+    saved_key = make_job_key(saved[0][2], saved[0][3], saved[0][4])
+    if saved_key != key:
+        raise RuntimeError(f"V3 test queue key mismatch at {target_range}")
+
+    pending_job_keys.add(key)
+    print(f"🧪 Test job queued at Pending_AI!{target_range}: {job['title']}")
+    return True
+
+
+def analyze_test_job(job, scenario):
+    """Return deterministic results so queue/persistence tests never consume AI quota."""
+    if scenario == "failed_ai":
+        return None, "TEST"
+
+    result = {
+        "match_score": 85,
+        "matched_skills": ["C", "Embedded C", "Python"],
+        "missing_skills": [],
+        "experience_match": "Suitable for an entry-level / fresher candidate.",
+        "reason": "V3 test harness: deterministic qualified result.",
+    }
+    return result, "TEST"
+
+
+def run_v3_test_scenario(
+    pending_worksheet,
+    failed_worksheet,
+    profile,
+    scenario,
+):
+    """Run one isolated V3 lifecycle test without real AI/API calls."""
+    global worksheet_global
+
+    print("\n" + "=" * 70)
+    print(f"🧪 V3 TEST SCENARIO: {scenario}")
+    print("=" * 70)
+
+    job = build_test_job(scenario)
+
+    if scenario == "pending_to_sheet1":
+        append_test_pending_job(
+            pending_worksheet,
+            job,
+            status="PENDING",
+            next_retry=format_timestamp(utc_now()),
+        )
+
+    elif scenario == "failed_ai":
+        append_test_pending_job(
+            pending_worksheet,
+            job,
+            status="PENDING",
+            retry_count=MAX_RETRIES,
+            next_retry=format_timestamp(utc_now()),
+            failure_reason="V3 test: force terminal AI failure",
+        )
+
+    elif scenario == "crash_recovery":
+        stale_time = format_timestamp(
+            utc_now() - timedelta(minutes=STALE_PROCESSING_MINUTES + 5)
+        )
+        append_test_pending_job(
+            pending_worksheet,
+            job,
+            status="PROCESSING",
+            retry_count=0,
+            last_attempt=stale_time,
+            next_retry=stale_time,
+            failure_reason="V3 test: simulated crashed PROCESSING job",
+        )
+    else:
+        raise ValueError(
+            "Unknown V3_TEST_SCENARIO. Use: all, pending_to_sheet1, "
+            "failed_ai, crash_recovery"
+        )
+
+    before_completed = stats["pending_completed"]
+    before_failed = stats["pending_failed"]
+    before_recovered = stats["queue_recovered"]
+
+    # For crash recovery, loading the queue must first recover the stale row.
+    # Then the normal queue processor continues the lifecycle using the test AI.
+    records = load_pending_records(pending_worksheet)
+    test_record = next(
+        (r for r in records if r["job_id"] == job["job_id"]),
+        None,
+    )
+
+    if test_record is None:
+        raise RuntimeError(f"V3 test job not found after queue insertion: {job['job_id']}")
+
+    if scenario == "crash_recovery":
+        if stats["queue_recovered"] <= before_recovered or test_record["status"] != "RETRY":
+            raise RuntimeError("Crash recovery test failed: stale PROCESSING was not recovered to RETRY.")
+        print("✅ Crash recovery state transition verified: PROCESSING → RETRY")
+
+    # Test jobs use deterministic analysis inside analyze_pending_job.
+    process_pending_queue(
+        pending_worksheet,
+        failed_worksheet,
+        profile,
+        ai_budget=1,
+    )
+
+    final_records = load_pending_records(pending_worksheet)
+    final_record = next(
+        (r for r in final_records if r["job_id"] == job["job_id"]),
+        None,
+    )
+
+    if final_record is None:
+        raise RuntimeError("V3 test job disappeared from Pending_AI.")
+
+    if scenario == "pending_to_sheet1":
+        if final_record["status"] != "COMPLETED":
+            raise RuntimeError(
+                f"Pending→Sheet1 test failed: final status is {final_record['status']}"
+            )
+        if stats["pending_completed"] <= before_completed:
+            raise RuntimeError("Pending→Sheet1 test failed: pending_completed did not increase.")
+        print("✅ Pending_AI → Sheet1 test PASSED")
+
+    elif scenario == "failed_ai":
+        if final_record["status"] != "FAILED":
+            raise RuntimeError(
+                f"Failed_AI test failed: final Pending_AI status is {final_record['status']}"
+            )
+        if stats["pending_failed"] <= before_failed:
+            raise RuntimeError("Failed_AI test failed: pending_failed did not increase.")
+
+        failed_rows = failed_worksheet.get_all_values()
+        found = any(
+            len(row) >= 1 and clean_text(row[0]) == job["job_id"]
+            for row in failed_rows[1:]
+        )
+        if not found:
+            raise RuntimeError("Failed_AI test failed: job was not copied to Failed_AI.")
+        print("✅ Pending_AI → Failed_AI test PASSED")
+
+    elif scenario == "crash_recovery":
+        if final_record["status"] != "COMPLETED":
+            raise RuntimeError(
+                f"Crash recovery test failed after recovery: final status is {final_record['status']}"
+            )
+        print("✅ Crash recovery → normal processing → Sheet1 test PASSED")
+
+    stats["test_passed"] += 1
+    return True
+
+
+def run_v3_test_suite(pending_worksheet, failed_worksheet, profile):
+    """Run all isolated V3 lifecycle tests and report a compact result."""
+    scenarios = [
+        "pending_to_sheet1",
+        "failed_ai",
+        "crash_recovery",
+    ]
+
+    if TEST_SCENARIO != "all":
+        scenarios = [TEST_SCENARIO]
+
+    print("\n" + "#" * 70)
+    print("🧪 V3 SAFE TEST SUITE ENABLED")
+    print("#" * 70)
+    print("No real Adzuna discovery or real AI analysis will run in test mode.")
+
+    for scenario in scenarios:
+        try:
+            run_v3_test_scenario(
+                pending_worksheet,
+                failed_worksheet,
+                profile,
+                scenario,
+            )
+        except Exception as exc:
+            stats["test_failed"] += 1
+            print(f"❌ V3 TEST FAILED [{scenario}]: {exc}")
+
+    print("\n" + "#" * 70)
+    print(
+        f"V3 TEST RESULT: {stats['test_passed']} passed, "
+        f"{stats['test_failed']} failed"
+    )
+    print("#" * 70)
+
+
 def analyze_pending_job(pending_worksheet, failed_worksheet, record, profile):
     """
     Process one persisted queue item.
@@ -2267,7 +2537,11 @@ def analyze_pending_job(pending_worksheet, failed_worksheet, record, profile):
     print(f"Company: {job['company']}")
     print(f"Retry Count: {record['retry_count']}")
 
-    result, provider = analyze_job(job, profile)
+    if TEST_MODE and job.get("job_id", "").startswith(TEST_JOB_PREFIX):
+        result, provider = analyze_test_job(job, TEST_SCENARIO)
+        print(f"🧪 Using deterministic test provider for {job['title']}")
+    else:
+        result, provider = analyze_job(job, profile)
 
     if result is None:
         queue_retry_or_fail(
@@ -2433,6 +2707,15 @@ def main():
         f"Existing jobs in Sheet: "
         f"{len(existing_job_keys)}"
     )
+
+    if TEST_MODE:
+        run_v3_test_suite(
+            pending_worksheet,
+            failed_worksheet,
+            profile,
+        )
+        print("🧪 Test mode complete. Real job discovery was skipped.")
+        return
     print(
         f"Existing active pending jobs: "
         f"{len(pending_job_keys)}"
@@ -2828,6 +3111,14 @@ def main():
         f"AI budget used: "
         f"{ai_counter}/{MAX_AI_JOBS}"
     )
+
+    if TEST_MODE:
+        print(
+            f"V3 test cases passed: {stats['test_passed']}"
+        )
+        print(
+            f"V3 test cases failed: {stats['test_failed']}"
+        )
 
     print("=" * 70)
     print("AI Job Tracker V3 Finished!")
