@@ -1,3 +1,4 @@
+
 name: AI Job Tracker
 
 on:
@@ -21,13 +22,6 @@ jobs:
       - name: Install dependencies
         run: |
           pip install requests gspread google-auth google-genai
-
-      - name: Test Gemini API
-        continue-on-error: true
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          python gemini_test.py
 
       - name: Run Job Tracker
         env:
