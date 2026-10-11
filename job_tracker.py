@@ -1,4 +1,4 @@
-# AI Job Tracker V3 - Persistent Queue + Quota-Aware Gemini + Groq + OpenAI + Safe Test Harness
+# AI Job Tracker V3 - Persistent Queue + Quota-Aware Groq + OpenAI + Safe Test Harness
 # V3: persistent queue, retry/backoff, provider health, recovery, quota-aware AI switching
 #
 # V2.2.1 fixes:
@@ -33,7 +33,6 @@ import requests
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
-from google import genai
 
 
 # ============================================================
@@ -60,12 +59,10 @@ PROVIDER_STATE_HEADERS = [
 # Soft per-day request budgets. These are configurable through GitHub Actions
 # environment variables and are intentionally conservative defaults.
 PROVIDER_DAILY_BUDGETS = {
-    "Gemini": int(os.environ.get("GEMINI_DAILY_BUDGET", "10")),
     "Groq": int(os.environ.get("GROQ_DAILY_BUDGET", "10")),
     "OpenAI": int(os.environ.get("OPENAI_DAILY_BUDGET", "5")),
 }
 
-AI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
 OPENAI_MODEL = "gpt-5.6-luna"
 
@@ -162,24 +159,18 @@ LOCATIONS = [
 # GLOBAL STATE
 # ============================================================
 
-gemini_client = None
-gemini_available = False
-gemini_rate_limited = False
-
 openai_available = False
 openai_rate_limited = False
 
 groq_rate_limited = False
 
 provider_health = {
-    "Gemini": "UNKNOWN",
     "Groq": "UNKNOWN",
     "OpenAI": "UNKNOWN",
 }
 
 # Persistent quota-aware switching state.
 provider_usage = {
-    "Gemini": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
     "Groq": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
     "OpenAI": {"quota_day": "", "calls": 0, "status": "UNKNOWN", "last_event": ""},
 }
@@ -198,7 +189,6 @@ stats = {
     "groq_errors": 0,
     "groq_invalid_json": 0,
     "groq_rate_limit": 0,
-    "gemini_invalid_json": 0,
     "openai_fallback_uses": 0,
     "openai_errors": 0,
     "openai_invalid_json": 0,
@@ -305,31 +295,6 @@ def load_candidate_profile():
         print(f"WARNING: Could not load profile.json: {exc}")
         return {}
 
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-def initialize_gemini():
-    global gemini_client, gemini_available
-
-    key = os.environ.get("GEMINI_API_KEY")
-
-    if not key:
-        provider_health["Gemini"] = "DISABLED"
-        print("Gemini API key not found. Groq fallback will be used.")
-        return
-
-    try:
-        gemini_client = genai.Client(api_key=key)
-        gemini_available = True
-        provider_health["Gemini"] = "AVAILABLE"
-        print("Gemini client initialized successfully!")
-
-    except Exception as exc:
-        print(f"Gemini initialization failed: {exc}")
-        gemini_available = False
-        provider_health["Gemini"] = "FAILED"
 
 
 # ============================================================
@@ -715,67 +680,6 @@ def normalize_ai_result(data):
     }
 
 
-# ============================================================
-# GEMINI ANALYSIS
-# ============================================================
-
-def analyze_with_gemini(job, profile):
-    global gemini_available
-    global gemini_rate_limited
-
-    if (
-        not gemini_available
-        or gemini_rate_limited
-        or gemini_client is None
-    ):
-        return None
-
-    try:
-        interaction = gemini_client.interactions.create(
-            model=AI_MODEL,
-            input=build_ai_prompt(job, profile),
-        )
-
-        raw = getattr(interaction, "output_text", None)
-
-        result = normalize_ai_result(
-            extract_json_object(raw)
-        )
-
-        if result is None:
-            stats["gemini_invalid_json"] += 1
-            print("Gemini returned invalid JSON.")
-            return None
-
-        return result
-
-    except Exception as exc:
-        msg = str(exc).lower()
-
-        if any(
-            x in msg
-            for x in [
-                "429",
-                "rate limit",
-                "quota",
-                "resource exhausted",
-            ]
-        ):
-            gemini_rate_limited = True
-            gemini_available = False
-            provider_health["Gemini"] = "RATE_LIMITED"
-            mark_provider_rate_limited("Gemini", "API rate limit/quota reached")
-
-            print("⚠️ GEMINI RATE LIMIT / QUOTA REACHED")
-            print("➡️ Switching to Groq fallback.")
-
-        else:
-            print(f"Gemini error: {exc}")
-            gemini_available = False
-            provider_health["Gemini"] = "FAILED"
-
-        return None
-
 
 # ============================================================
 # GROQ ANALYSIS
@@ -942,16 +846,11 @@ def analyze_job(job, profile):
     """
     Quota-aware sequential AI router.
 
-    Order is always Gemini -> Groq -> OpenAI. A provider is skipped when:
-    - its API key is missing,
-    - its persistent daily budget is exhausted,
-    - it was rate-limited earlier in the same day/run,
-    - or it is otherwise unavailable.
-
-    This means a later workflow can continue from the next provider instead
-    of restarting the first provider at every scheduled run.
+    Order is Groq -> OpenAI. A provider is skipped when its API key is
+    missing, its persistent daily budget is exhausted, it was rate-limited,
+    or it is otherwise unavailable. Jobs remain queued if both providers fail.
     """
-    providers = ("Gemini", "Groq", "OpenAI")
+    providers = ("Groq", "OpenAI")
 
     for provider in providers:
         if not provider_can_be_used(provider):
@@ -960,9 +859,7 @@ def analyze_job(job, profile):
         if not reserve_provider_call(provider):
             continue
 
-        if provider == "Gemini":
-            result = analyze_with_gemini(job, profile)
-        elif provider == "Groq":
+        if provider == "Groq":
             stats["groq_fallback_uses"] += 1
             result = analyze_with_groq(job, profile)
         else:
@@ -976,10 +873,7 @@ def analyze_job(job, profile):
 
         # A failed provider may have become RATE_LIMITED. If it failed for
         # another reason, the next provider is still tried for this job.
-        if provider == "Gemini":
-            if gemini_rate_limited:
-                print("🔀 Gemini unavailable for this quota window → Groq.")
-        elif provider == "Groq":
+        if provider == "Groq":
             if groq_rate_limited:
                 print("🔀 Groq unavailable for this quota window → OpenAI.")
         elif provider == "OpenAI":
@@ -1119,8 +1013,6 @@ def get_provider_budget(provider):
 
 
 def provider_has_key(provider):
-    if provider == "Gemini":
-        return bool(os.environ.get("GEMINI_API_KEY"))
     if provider == "Groq":
         return bool(os.environ.get("GROQ_API_KEY"))
     if provider == "OpenAI":
@@ -1263,7 +1155,7 @@ def load_provider_state():
         )
 
     print("\n🔀 QUOTA-AWARE AI PROVIDER STATE")
-    for provider in ("Gemini", "Groq", "OpenAI"):
+    for provider in ("Groq", "OpenAI"):
         state = provider_usage[provider]
         print(
             f"{provider}: {state['calls']}/{get_provider_budget(provider)} "
@@ -1278,8 +1170,6 @@ def provider_can_be_used(provider):
         return False
 
     # Runtime provider health still matters after a persisted daily reset.
-    if provider == "Gemini" and (not gemini_available or gemini_rate_limited):
-        return False
     if provider == "Groq" and groq_rate_limited:
         return False
     if provider == "OpenAI" and (not openai_available or openai_rate_limited):
@@ -2352,11 +2242,6 @@ def get_ai_failure_reason():
     """Return the current provider-health reason."""
     reasons = []
 
-    if not gemini_available:
-        if gemini_rate_limited:
-            reasons.append("Gemini rate limit/quota reached")
-        else:
-            reasons.append("Gemini unavailable")
 
     if groq_rate_limited:
         reasons.append("Groq rate limit reached")
@@ -2941,7 +2826,7 @@ def process_pending_queue(pending_worksheet, failed_worksheet, profile, ai_budge
         # If the provider became unavailable, remaining pending jobs stay queued.
         if not any(
             provider_can_be_used(provider)
-            for provider in ("Gemini", "Groq", "OpenAI")
+            for provider in ("Groq", "OpenAI")
         ):
             print(
                 "⚠️ All AI providers unavailable or daily budgets exhausted; "
@@ -2963,7 +2848,6 @@ def main():
     print("=" * 70)
 
     profile = load_candidate_profile()
-    initialize_gemini()
 
     global openai_available
     global openai_rate_limited
@@ -3113,7 +2997,7 @@ def main():
                     # ----------------------------------------
                     ai_provider_available = any(
                         provider_can_be_used(provider)
-                        for provider in ("Gemini", "Groq", "OpenAI")
+                        for provider in ("Groq", "OpenAI")
                     )
 
                     if not ai_provider_available:
@@ -3356,13 +3240,9 @@ def main():
         f"OpenAI rate-limit events: "
         f"{stats['openai_rate_limit']}"
     )
-    print(
-        f"Gemini invalid JSON: "
-        f"{stats['gemini_invalid_json']}"
-    )
 
     print("\n🔀 Persistent AI Provider Usage:")
-    for provider in ("Gemini", "Groq", "OpenAI"):
+    for provider in ("Groq", "OpenAI"):
         state = provider_usage[provider]
         print(
             f"{provider}: {state['calls']}/{get_provider_budget(provider)} "
@@ -3391,10 +3271,6 @@ def main():
         f"{max(0, len(failed_records) - 1)}"
     )
 
-    print(
-        f"Gemini provider health: "
-        f"{provider_health.get('Gemini', 'UNKNOWN')}"
-    )
     print(
         f"Groq provider health: "
         f"{provider_health.get('Groq', 'UNKNOWN')}"
