@@ -1,4 +1,3 @@
-
 name: AI Job Tracker
 
 on:
@@ -21,14 +20,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests gspread google-auth google-genai
+          pip install requests gspread google-auth
 
       - name: Run Job Tracker
         env:
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
